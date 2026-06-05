@@ -1,0 +1,121 @@
+# tmuxmux
+
+A fast native GUI for working across many tmux sessions on many machines.
+
+tmuxmux connects to the hosts you give it, lists every tmux session it finds,
+and attaches to them in its own dedicated terminal window — so your remote
+sessions don't have to share a terminal with everything else you're doing.
+Switching between sessions on different machines is one keystroke.
+
+![tmuxmux](docs/screenshot.png)
+
+Built with Rust, [egui](https://github.com/emilk/egui),
+[portable-pty](https://crates.io/crates/portable-pty) and
+[vt100](https://crates.io/crates/vt100-ctt). One static binary, cross-platform
+architecture (developed and tested on Linux, including Asahi/aarch64).
+
+## Features
+
+- **Session tree sidebar** — every host's tmux sessions, listed in parallel,
+  one click (or Enter) to attach. Dead sessions reconnect on Enter.
+- **Real terminal emulation** — 256-color and truecolor, bold/dim/underline/
+  inverse, box-drawing (including DEC special graphics translation, so
+  curses apps and tmux borders render as lines, not `qqqq`), block cursor,
+  bracketed paste, application cursor keys.
+- **Selection & clipboard** — drag to select, `Ctrl+Shift+C` / `Ctrl+Shift+V`
+  to copy/paste. Plain `Ctrl+C` still sends SIGINT like a terminal should.
+- **Mouse passthrough** — clicks, drags and wheel are forwarded to tmux when
+  the app requests mouse reporting (hold Shift to select locally instead).
+- **Flexible connections** — plain ssh (aliases, FQDNs, IPs), the local
+  machine, or an arbitrary command line for jump hosts / sshpass /
+  cloudflared tunnels.
+- **Scriptable** — a `--script` mode drives the app headlessly (attach, send
+  keys, screenshot, select, copy) for testing and automation.
+
+## Install
+
+```sh
+git clone https://github.com/qume/tmuxmux
+cd tmuxmux
+cargo build --release
+# binary at target/release/tmuxmux
+```
+
+On machines with ≤8 GB RAM, build with `cargo build --release -j 3` to keep
+parallel rustc instances from exhausting memory.
+
+## Configure
+
+Copy [`hosts.toml.example`](hosts.toml.example) to `hosts.toml` and edit.
+The config is searched for next to the binary, in the current directory,
+then in `~/.config/tmuxmux/hosts.toml`.
+
+```toml
+[[hosts]]
+name = "localhost"
+local = true
+
+# Anything ssh can resolve; key-based auth (BatchMode) is assumed.
+[[hosts]]
+name = "buildbox"
+
+# Full custom command for tunnels/jump hosts — tmux attach is appended.
+[[hosts]]
+name = "tunnelled-app"
+command = "sshpass -p secret ssh -tt -o ProxyCommand='cloudflared access ssh --hostname app-ssh.example.com' dev@app-ssh.example.com"
+```
+
+tmux is attached with `-u`, so box-drawing arrives as UTF-8 even though ssh
+doesn't forward your locale.
+
+## Keys
+
+| Key | Action |
+|---|---|
+| drag | select text |
+| `Ctrl+Shift+C` | copy selection |
+| `Ctrl+Shift+V` | paste |
+| `Ctrl+click` | open URL under cursor |
+| `Ctrl+]` / `Ctrl+\` | next / previous session |
+| `Ctrl+Shift+E` | focus the session tree |
+| `F2` | toggle sidebar |
+| `F5` | refresh session lists |
+| `Ctrl+Shift+Q` | quit |
+
+Everything else — including plain `Ctrl+C`/`Ctrl+V`, `Esc`, `Tab`, arrows and
+F-keys — goes to the terminal. In the tree: arrows or `j`/`k` navigate,
+`Enter` connects.
+
+## Scripting / testing
+
+`--script` runs a `;;`-separated step list, so the app can be driven without
+a human (screenshots land as PNGs, selection/clipboard print to stdout):
+
+```sh
+./target/release/tmuxmux --script \
+  "sleep:1500;;attach:localhost/demo;;sleep:2000;;keys:ls\n;;sleep:500;;\
+   shot:/tmp/shot.png;;select:0,0,2,40;;print-selection;;copy;;print-clipboard;;quit"
+```
+
+Steps: `sleep:MS`, `attach:HOST/SESSION`, `keys:TEXT` (`\n \r \t \e \xNN`),
+`shot:PATH`, `select:R1,C1,R2,C2`, `copy`, `paste`, `print-selection`,
+`print-clipboard`, `quit`. There's also `--list`, which prints each host's
+sessions to stdout and exits.
+
+## Design notes
+
+Two pitfalls that bite terminal-emulator front-ends, both handled here:
+
+- **Default colors are asymmetric.** A vt100 cell reports `Color::Default`
+  for both unset foregrounds *and* unset backgrounds — but they must resolve
+  differently (light text, black background). Map them through one converter
+  and every uncolored cell gets a painted-over background.
+- **DEC special graphics still exist.** When tmux thinks a client can't do
+  UTF-8 (e.g. ssh didn't forward a locale), it downgrades box-drawing to the
+  alternate character set (`ESC(0`, where `q` is `─`). tmuxmux both forces a
+  UTF-8 client (`tmux -u`) and translates ACS to Unicode in an
+  escape-sequence-aware filter (`src/acs.rs`) for everything else.
+
+## License
+
+[MIT](LICENSE)
