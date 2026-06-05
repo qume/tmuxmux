@@ -21,6 +21,8 @@ use app::App;
 ///   paste                 paste system clipboard into the pty
 ///   print-selection       print the selected text to stdout
 ///   print-clipboard       print the system clipboard to stdout
+///   newmodal:HOST         open the new-session dialog for a host
+///   modal-accept          accept the dialog (create + attach)
 ///   quit                  exit the app
 #[derive(Debug, Clone)]
 enum Step {
@@ -33,6 +35,8 @@ enum Step {
     Paste,
     PrintSelection,
     PrintClipboard,
+    NewModal(String),
+    ModalAccept,
     Quit,
 }
 
@@ -68,6 +72,8 @@ fn parse_script(s: &str) -> Vec<Step> {
             }
             "copy" => Some(Step::Copy),
             "paste" => Some(Step::Paste),
+            "newmodal" => Some(Step::NewModal(arg.trim().to_string())),
+            "modal-accept" => Some(Step::ModalAccept),
             "print-selection" => Some(Step::PrintSelection),
             "print-clipboard" => Some(Step::PrintClipboard),
             "quit" => Some(Step::Quit),
@@ -155,6 +161,8 @@ impl eframe::App for MainApp {
                 self.inner.render_terminal(ui);
             });
 
+        self.inner.render_modal(ctx);
+
         // Steady repaint while a terminal is attached or a script is driving.
         let scripting = self.script_idx < self.script.len() || self.pending_shot;
         if self.inner.focus == app::Focus::Terminal || scripting {
@@ -196,6 +204,8 @@ impl MainApp {
                         self.inner.selection_text().unwrap_or_default()
                     );
                 }
+                Step::NewModal(h) => self.inner.open_new_session_modal_by_host(&h),
+                Step::ModalAccept => self.inner.accept_modal(),
                 Step::PrintClipboard => {
                     let text = arboard::Clipboard::new()
                         .and_then(|mut c| c.get_text())

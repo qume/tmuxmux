@@ -18,6 +18,11 @@ architecture (developed and tested on Linux, including Asahi/aarch64).
 
 - **Session tree sidebar** — every host's tmux sessions, listed in parallel,
   one click (or Enter) to attach. Dead sessions reconnect on Enter.
+- **Create sessions** — a `+ new` row under each host opens a name dialog
+  (pre-filled with a colour name that doesn't clash with existing sessions)
+  and creates-and-attaches in one shot via `tmux new-session -A`. Works the
+  same on plain ssh hosts, the local machine and custom tunnel commands —
+  no config changes needed.
 - **Real terminal emulation** — 256-color and truecolor, bold/dim/underline/
   inverse, box-drawing (including DEC special graphics translation, so
   curses apps and tmux borders render as lines, not `qqqq`), block cursor,
@@ -84,7 +89,7 @@ doesn't forward your locale.
 
 Everything else — including plain `Ctrl+C`/`Ctrl+V`, `Esc`, `Tab`, arrows and
 F-keys — goes to the terminal. In the tree: arrows or `j`/`k` navigate,
-`Enter` connects.
+`Enter` connects (or, on a `+ new` row, opens the create dialog).
 
 ## Scripting / testing
 
@@ -99,8 +104,8 @@ a human (screenshots land as PNGs, selection/clipboard print to stdout):
 
 Steps: `sleep:MS`, `attach:HOST/SESSION`, `keys:TEXT` (`\n \r \t \e \xNN`),
 `shot:PATH`, `select:R1,C1,R2,C2`, `copy`, `paste`, `print-selection`,
-`print-clipboard`, `quit`. There's also `--list`, which prints each host's
-sessions to stdout and exits.
+`print-clipboard`, `newmodal:HOST`, `modal-accept`, `quit`. There's also
+`--list`, which prints each host's sessions to stdout and exits.
 
 ## Design notes
 

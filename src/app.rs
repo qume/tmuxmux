@@ -29,7 +29,24 @@ pub struct HostEntry {
 enum Row {
     Host(usize),
     Session(usize, usize),
+    /// The "+ new" row at the end of a host's session list.
+    NewSession(usize),
 }
+
+/// State of the "create new session" dialog.
+pub struct NewSessionModal {
+    pub host_idx: usize,
+    pub name: String,
+    just_opened: bool,
+}
+
+/// Pool of conflict-free default session names.
+const NAME_POOL: &[&str] = &[
+    "red", "orange", "yellow", "green", "blue", "indigo", "violet", "cyan",
+    "magenta", "teal", "coral", "amber", "olive", "maroon", "navy", "plum",
+    "salmon", "sienna", "khaki", "crimson", "turquoise", "lavender", "mint",
+    "jade", "ruby", "slate", "ochre", "pearl", "cobalt", "saffron",
+];
 
 /// Selection endpoints in cell coordinates (row, col), in stream order.
 #[derive(Clone, Copy, Debug)]
@@ -75,6 +92,7 @@ pub struct App {
     pub selection: Option<Selection>,
     selecting: bool,
     clipboard: Option<arboard::Clipboard>,
+    pub modal: Option<NewSessionModal>,
 
     layout: Option<TermLayout>,
     status: String,
@@ -117,6 +135,7 @@ impl App {
             selection: None,
             selecting: false,
             clipboard,
+            modal: None,
             layout: None,
             status: "loading sessions...".into(),
             font_size: 14.0,
@@ -163,22 +182,26 @@ impl App {
     }
 
     pub fn activate_session(&mut self, host_name: &str, session_name: &str) {
-        let key = format!("{}/{}", host_name, session_name);
+        let host = match self.config.hosts.iter().find(|h| h.name == host_name) {
+            Some(h) => h.clone(),
+            None => {
+                self.status = format!("unknown host: {host_name}");
+                return;
+            }
+        };
+        let cmd = build_attach_command(&host, session_name);
+        self.open_pane(&host, session_name, cmd);
+    }
+
+    fn open_pane(&mut self, host: &Host, session_name: &str, cmd: Vec<String>) {
+        let key = format!("{}/{}", host.name, session_name);
         if let Some(pane) = self.panes.get(&key) {
             if !pane.alive {
                 self.panes.remove(&key);
             }
         }
         if !self.panes.contains_key(&key) {
-            let host = match self.config.hosts.iter().find(|h| h.name == host_name) {
-                Some(h) => h.clone(),
-                None => {
-                    self.status = format!("unknown host: {host_name}");
-                    return;
-                }
-            };
             let env = merge_env(&self.config.env, &host.env);
-            let cmd = build_attach_command(&host, session_name);
             log::info!("spawning: {:?}", cmd);
             let (cols, rows) = self
                 .layout
@@ -193,6 +216,70 @@ impl App {
         self.selection = None;
         self.selecting = false;
         self.status = key;
+    }
+
+    // ---------- new-session modal ----------
+
+    /// First name from the pool not already used on this host; falls back to
+    /// numbered variants if someone has thirty sessions of colours.
+    fn default_session_name(&self, host_idx: usize) -> String {
+        let used = &self.hosts[host_idx].sessions;
+        for name in NAME_POOL {
+            if !used.iter().any(|s| s == name) {
+                return (*name).to_string();
+            }
+        }
+        for n in 2.. {
+            for name in NAME_POOL {
+                let candidate = format!("{name}-{n}");
+                if !used.iter().any(|s| s == &candidate) {
+                    return candidate;
+                }
+            }
+        }
+        unreachable!()
+    }
+
+    pub fn open_new_session_modal(&mut self, host_idx: usize) {
+        let name = self.default_session_name(host_idx);
+        self.modal = Some(NewSessionModal {
+            host_idx,
+            name,
+            just_opened: true,
+        });
+    }
+
+    pub fn open_new_session_modal_by_host(&mut self, host_name: &str) {
+        if let Some(idx) = self.hosts.iter().position(|e| e.host.name == host_name) {
+            self.open_new_session_modal(idx);
+        } else {
+            self.status = format!("unknown host: {host_name}");
+        }
+    }
+
+    /// Create the session named in the modal and attach to it.
+    pub fn accept_modal(&mut self) {
+        let Some(modal) = self.modal.take() else {
+            return;
+        };
+        // tmux session names may not contain ':' or '.'.
+        let name: String = modal
+            .name
+            .trim()
+            .replace([':', '.'], "-")
+            .replace(char::is_whitespace, "-");
+        if name.is_empty() {
+            self.status = "session name empty — cancelled".into();
+            return;
+        }
+        let host = self.config.hosts[modal.host_idx].clone();
+        let cmd = crate::ssh::build_new_session_command(&host, &name);
+        self.open_pane(&host, &name, cmd);
+        // Show it in the sidebar immediately; the next refresh confirms it.
+        let entry = &mut self.hosts[modal.host_idx];
+        if !entry.sessions.iter().any(|s| s == &name) {
+            entry.sessions.push(name);
+        }
     }
 
     pub fn active_pane_mut(&mut self) -> Option<&mut TerminalPane> {
@@ -330,6 +417,11 @@ impl App {
 
     /// Process raw egui events. Returns true if the app should quit.
     pub fn handle_events(&mut self, ctx: &egui::Context) -> bool {
+        // While the new-session dialog is open, leave all input to egui so
+        // its TextEdit receives keystrokes; the dialog handles Enter/Esc.
+        if self.modal.is_some() {
+            return false;
+        }
         let (events, modifiers) = ctx.input(|i| (i.events.clone(), i.modifiers));
         let mut quit = false;
 
@@ -472,6 +564,9 @@ impl App {
                 for si in 0..entry.sessions.len() {
                     rows.push(Row::Session(hi, si));
                 }
+                if entry.loaded && entry.error.is_none() {
+                    rows.push(Row::NewSession(hi));
+                }
             }
         }
         rows
@@ -490,11 +585,12 @@ impl App {
             egui::Key::ArrowDown => {
                 self.tree_cursor = (self.tree_cursor + 1).min(rows.len() - 1);
             }
-            egui::Key::ArrowLeft => {
-                if let Row::Host(hi) = rows[self.tree_cursor] {
+            egui::Key::ArrowLeft => match rows[self.tree_cursor] {
+                Row::Host(hi) | Row::NewSession(hi) => {
                     self.hosts[hi].expanded = false;
                 }
-            }
+                Row::Session(..) => {}
+            },
             egui::Key::ArrowRight => {
                 if let Row::Host(hi) = rows[self.tree_cursor] {
                     self.hosts[hi].expanded = true;
@@ -508,6 +604,9 @@ impl App {
                     let h = self.hosts[hi].host.name.clone();
                     let s = self.hosts[hi].sessions[si].clone();
                     self.activate_session(&h, &s);
+                }
+                Row::NewSession(hi) => {
+                    self.open_new_session_modal(hi);
                 }
             },
             _ => {}
@@ -527,6 +626,7 @@ impl App {
         let rows = self.visible_rows();
         let mut pending: Option<(String, String)> = None;
         let mut toggle: Option<usize> = None;
+        let mut new_modal: Option<usize> = None;
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             for (i, row) in rows.iter().enumerate() {
@@ -560,6 +660,9 @@ impl App {
                         };
                         (e.sessions[*si].clone(), 24.0, color, active)
                     }
+                    Row::NewSession(_) => {
+                        ("+ new".to_string(), 24.0, Color32::from_gray(130), false)
+                    }
                 };
 
                 let desired = Vec2::new(ui.available_width(), 20.0);
@@ -589,6 +692,7 @@ impl App {
                             let e = &self.hosts[*hi];
                             pending = Some((e.host.name.clone(), e.sessions[*si].clone()));
                         }
+                        Row::NewSession(hi) => new_modal = Some(*hi),
                     }
                 }
             }
@@ -599,6 +703,59 @@ impl App {
         }
         if let Some((h, s)) = pending {
             self.activate_session(&h, &s);
+        }
+        if let Some(hi) = new_modal {
+            self.open_new_session_modal(hi);
+        }
+    }
+
+    /// The "create new session" dialog. Rendered last so it sits on top.
+    pub fn render_modal(&mut self, ctx: &egui::Context) {
+        let Some(host_idx) = self.modal.as_ref().map(|m| m.host_idx) else {
+            return;
+        };
+        let host_name = self.hosts[host_idx].host.name.clone();
+        let modal_state = self.modal.as_mut().unwrap();
+        let mut accept = false;
+        let mut cancel = false;
+
+        let response = egui::Modal::new(egui::Id::new("new_session_modal")).show(ctx, |ui| {
+            ui.set_width(320.0);
+            ui.heading(format!("new session on {host_name}"));
+            ui.add_space(8.0);
+            let edit = ui.add(
+                egui::TextEdit::singleline(&mut modal_state.name)
+                    .hint_text("session name")
+                    .desired_width(f32::INFINITY),
+            );
+            if modal_state.just_opened {
+                modal_state.just_opened = false;
+                edit.request_focus();
+            }
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button("create").clicked() {
+                    accept = true;
+                }
+                if ui.button("cancel").clicked() {
+                    cancel = true;
+                }
+            });
+            if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                accept = true;
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                cancel = true;
+            }
+        });
+        if response.backdrop_response.clicked() {
+            cancel = true;
+        }
+
+        if accept {
+            self.accept_modal();
+        } else if cancel {
+            self.modal = None;
         }
     }
 

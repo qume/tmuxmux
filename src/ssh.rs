@@ -66,6 +66,27 @@ pub fn build_attach_command(host: &Host, session: &str) -> Vec<String> {
     }
 }
 
+/// Command that creates-or-attaches a session in one shot. `new-session -A`
+/// attaches when the name already exists, so there's no separate round-trip
+/// (and no race) between creating and attaching.
+pub fn build_new_session_command(host: &Host, session: &str) -> Vec<String> {
+    let tail = ["tmux", "-u", "new-session", "-A", "-s", session];
+    if host.local {
+        tail.iter().map(|s| s.to_string()).collect()
+    } else if let Some(ref raw) = host.command {
+        let mut parts = shlex_like_split(raw);
+        parts.extend(tail.iter().map(|s| s.to_string()));
+        parts
+    } else {
+        let mut parts = vec!["ssh".to_string()];
+        parts.extend(SSH_OPTS.iter().map(|s| s.to_string()));
+        parts.push("-t".to_string());
+        parts.push(ssh_target(host));
+        parts.extend(tail.iter().map(|s| s.to_string()));
+        parts
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionListResult {
     pub host_name: String,
