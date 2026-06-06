@@ -23,6 +23,22 @@ architecture (developed and tested on Linux, including Asahi/aarch64).
   and creates-and-attaches in one shot via `tmux new-session -A`. Works the
   same on plain ssh hosts, the local machine and custom tunnel commands —
   no config changes needed.
+- **Session cache & resurrection** — every host is snapshotted on a timer
+  (windows, panes, layouts, working directories, and the full command line
+  running in each pane, recovered from the remote process tree). Snapshots
+  land in a local sqlite database. Sessions that vanish — a closed window,
+  or a whole VM rebooting — appear under a dim `⟲ closed (N)` group in the
+  sidebar: restore one (windows, splits, cwds and commands re-created and
+  re-run) or `⟲ restore all` to repopulate a freshly rebooted machine.
+  Cached cwds that no longer exist fall back to `$HOME` instead of failing.
+- **Live hints** — the sidebar shows what's running in each session
+  ("claude", "vim", …) and refreshes itself from the same snapshots; F5
+  forces a poll.
+
+<p align="center">
+  <img src="docs/closed.png" width="320" alt="closed sessions in the sidebar">
+  <img src="docs/restore.png" width="430" alt="restore dialog">
+</p>
 - **Real terminal emulation** — 256-color and truecolor, bold/dim/underline/
   inverse, box-drawing (including DEC special graphics translation, so
   curses apps and tmux borders render as lines, not `qqqq`), block cursor,
@@ -73,6 +89,21 @@ command = "sshpass -p secret ssh -tt -o ProxyCommand='cloudflared access ssh --h
 tmux is attached with `-u`, so box-drawing arrives as UTF-8 even though ssh
 doesn't forward your locale.
 
+The session cache is on by default (sqlite at
+`~/.local/share/tmuxmux/sessions.db`, hosts polled every 60 s, closed
+sessions kept 30 days). Tune or relocate it with an optional `[cache]`
+section:
+
+```toml
+[cache]
+interval_secs = 60     # 0 = only snapshot at startup and on F5
+retention_days = 30
+# path = "/somewhere/else/sessions.db"
+```
+
+`--db PATH` and `--cache-interval SECS` override the config; `--dump-cache`
+prints everything the cache knows and exits.
+
 ## Keys
 
 | Key | Action |
@@ -104,12 +135,29 @@ a human (screenshots land as PNGs, selection/clipboard print to stdout):
 
 Steps: `sleep:MS`, `attach:HOST/SESSION`, `keys:TEXT` (`\n \r \t \e \xNN`),
 `shot:PATH`, `select:R1,C1,R2,C2`, `copy`, `paste`, `print-selection`,
-`print-clipboard`, `newmodal:HOST`, `modal-accept`, `quit`. There's also
-`--list`, which prints each host's sessions to stdout and exits.
+`print-clipboard`, `newmodal:HOST`, `modal-accept`, `snapshot-now`,
+`restore:HOST/NAME`, `restoremodal:HOST/NAME`, `restore-all:HOST`,
+`dump-live:HOST`, `dump-closed:HOST`, `quit`. There's also `--list` (print
+each host's sessions and exit) and `--snap HOST` (print one parsed snapshot
+and exit — handy for debugging capture).
+
+Headless testing tip: the suite runs against a private compositor
+(`weston --backend=headless --idle-time=0`) so a locked or sleeping desktop
+can't stall it.
 
 ## Design notes
 
-Two pitfalls that bite terminal-emulator front-ends, both handled here:
+Pitfalls that bite terminal-emulator front-ends, all handled here:
+
+- **vsync can freeze the whole app.** With vsync on, `eglSwapBuffers`
+  blocks waiting for a compositor frame callback — which never arrives
+  while the screen is locked, blanked, or the window is fully occluded.
+  tmuxmux runs with vsync off and paces itself with egui's
+  `request_repaint_after`.
+- **tmux output mangles delimiters.** Snapshot parsing can't use control
+  characters as field separators (tmux octal-escapes them on output) nor
+  non-ASCII (hosts without a UTF-8 locale flatten it to `_`). Only
+  printable ASCII survives everywhere.
 
 - **Default colors are asymmetric.** A vt100 cell reports `Color::Default`
   for both unset foregrounds *and* unset backgrounds — but they must resolve

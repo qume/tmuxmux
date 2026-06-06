@@ -2,7 +2,10 @@ mod acs;
 mod app;
 mod colors;
 mod config;
+mod db;
 mod input;
+mod restore;
+mod snapshot;
 mod ssh;
 mod terminal;
 
@@ -22,7 +25,13 @@ use app::App;
 ///   print-selection       print the selected text to stdout
 ///   print-clipboard       print the system clipboard to stdout
 ///   newmodal:HOST         open the new-session dialog for a host
-///   modal-accept          accept the dialog (create + attach)
+///   modal-accept          accept the open dialog
+///   snapshot-now          poll all hosts immediately
+///   restore:HOST/NAME     restore a cached session and attach
+///   restoremodal:HOST/NAME open the restore dialog for a cached session
+///   restore-all:HOST      restore every cached session on a host
+///   dump-live:HOST        print the live session list to stdout
+///   dump-closed:HOST      print the cached/closed session list to stdout
 ///   quit                  exit the app
 #[derive(Debug, Clone)]
 enum Step {
@@ -37,6 +46,13 @@ enum Step {
     PrintClipboard,
     NewModal(String),
     ModalAccept,
+    SnapshotNow,
+    Restore(String, String),
+    RestoreModal(String, String),
+    RestoreAll(String),
+    DumpLive(String),
+    DumpClosed(String),
+    ExpandClosed(String),
     Quit,
 }
 
@@ -74,6 +90,19 @@ fn parse_script(s: &str) -> Vec<Step> {
             "paste" => Some(Step::Paste),
             "newmodal" => Some(Step::NewModal(arg.trim().to_string())),
             "modal-accept" => Some(Step::ModalAccept),
+            "snapshot-now" => Some(Step::SnapshotNow),
+            "restore" => arg
+                .trim()
+                .split_once('/')
+                .map(|(h, s)| Step::Restore(h.to_string(), s.to_string())),
+            "restoremodal" => arg
+                .trim()
+                .split_once('/')
+                .map(|(h, s)| Step::RestoreModal(h.to_string(), s.to_string())),
+            "restore-all" => Some(Step::RestoreAll(arg.trim().to_string())),
+            "dump-live" => Some(Step::DumpLive(arg.trim().to_string())),
+            "dump-closed" => Some(Step::DumpClosed(arg.trim().to_string())),
+            "expand-closed" => Some(Step::ExpandClosed(arg.trim().to_string())),
             "print-selection" => Some(Step::PrintSelection),
             "print-clipboard" => Some(Step::PrintClipboard),
             "quit" => Some(Step::Quit),
@@ -100,7 +129,7 @@ impl eframe::App for MainApp {
     fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {}
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.inner.check_listing_results();
+        self.inner.check_results();
         self.inner.read_all_panes();
 
         // Save any screenshots delivered by the backend.
@@ -206,6 +235,73 @@ impl MainApp {
                 }
                 Step::NewModal(h) => self.inner.open_new_session_modal_by_host(&h),
                 Step::ModalAccept => self.inner.accept_modal(),
+                Step::SnapshotNow => self.inner.poll_now(),
+                Step::Restore(h, s) => match self.inner.host_index(&h) {
+                    Some(hi) => self.inner.restore_sessions(hi, vec![s], true),
+                    None => eprintln!("script: unknown host {h}"),
+                },
+                Step::RestoreModal(h, s) => match self.inner.host_index(&h) {
+                    Some(hi) => self.inner.open_restore_modal(hi, &s),
+                    None => eprintln!("script: unknown host {h}"),
+                },
+                Step::RestoreAll(h) => match self.inner.host_index(&h) {
+                    Some(hi) => {
+                        let names: Vec<String> = self.inner.hosts[hi]
+                            .closed
+                            .iter()
+                            .map(|c| c.name.clone())
+                            .collect();
+                        self.inner.restore_sessions(hi, names, false);
+                    }
+                    None => eprintln!("script: unknown host {h}"),
+                },
+                Step::DumpLive(h) => {
+                    let line = self
+                        .inner
+                        .host_index(&h)
+                        .map(|hi| {
+                            self.inner.hosts[hi]
+                                .sessions
+                                .iter()
+                                .map(|s| {
+                                    format!(
+                                        "{}[{}]",
+                                        s.name,
+                                        s.hint.as_deref().unwrap_or("")
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        })
+                        .unwrap_or_else(|| "?unknown-host".into());
+                    println!("LIVE:{h}>>>{line}<<<");
+                }
+                Step::ExpandClosed(h) => {
+                    if let Some(hi) = self.inner.host_index(&h) {
+                        self.inner.hosts[hi].closed_expanded = true;
+                    }
+                }
+                Step::DumpClosed(h) => {
+                    let line = self
+                        .inner
+                        .host_index(&h)
+                        .map(|hi| {
+                            self.inner.hosts[hi]
+                                .closed
+                                .iter()
+                                .map(|c| {
+                                    format!(
+                                        "{}[{}]",
+                                        c.name,
+                                        c.hint.as_deref().unwrap_or("")
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        })
+                        .unwrap_or_else(|| "?unknown-host".into());
+                    println!("CLOSED:{h}>>>{line}<<<");
+                }
                 Step::PrintClipboard => {
                     let text = arboard::Clipboard::new()
                         .and_then(|mut c| c.get_text())
@@ -246,6 +342,10 @@ fn main() {
     let mut config_path: Option<PathBuf> = None;
     let mut script = String::new();
     let mut list_and_exit = false;
+    let mut dump_cache = false;
+    let mut db_path: Option<PathBuf> = None;
+    let mut cache_interval: Option<u64> = None;
+    let mut snap_host: Option<String> = None;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -256,11 +356,22 @@ fn main() {
                 }
             }
             "--list" => list_and_exit = true,
+            "--dump-cache" => dump_cache = true,
+            "--snap" => {
+                // Debug: take one snapshot of a host and print it.
+                snap_host = it.next().cloned();
+            }
+            "--db" => db_path = it.next().map(PathBuf::from),
+            "--cache-interval" => cache_interval = it.next().and_then(|s| s.parse().ok()),
             "--help" | "-h" => {
                 println!(
-                    "usage: tmuxmux [hosts.toml] [--list] [--script 'step;;step;;...']\n\
+                    "usage: tmuxmux [hosts.toml] [--list] [--dump-cache] [--db PATH]\n\
+                     [--cache-interval SECS] [--script 'step;;step;;...']\n\
                      script steps: sleep:MS attach:HOST/SESSION keys:TEXT shot:PATH\n\
-                     select:R1,C1,R2,C2 copy paste print-selection print-clipboard quit"
+                     select:R1,C1,R2,C2 copy paste print-selection print-clipboard\n\
+                     newmodal:HOST modal-accept snapshot-now restore:HOST/NAME\n\
+                     restoremodal:HOST/NAME restore-all:HOST dump-live:HOST\n\
+                     dump-closed:HOST quit"
                 );
                 return;
             }
@@ -285,6 +396,48 @@ fn main() {
     };
     log::info!("loaded {} hosts from {}", cfg.hosts.len(), path.display());
 
+    if let Some(name) = snap_host {
+        match cfg.hosts.iter().find(|h| h.name == name) {
+            Some(host) => {
+                let r = snapshot::take_snapshot(host.clone());
+                println!("error: {:?}", r.error);
+                for s in r.sessions {
+                    println!("session {} created={:?}", s.name, s.created_at);
+                    for p in s.panes {
+                        println!(
+                            "  {}:{} ({}) cwd={} cmd={} cmdline={:?} layout={}",
+                            p.window_index,
+                            p.pane_index,
+                            p.window_name,
+                            p.cwd,
+                            p.command,
+                            p.cmdline,
+                            p.window_layout
+                        );
+                    }
+                }
+            }
+            None => eprintln!("unknown host {name}"),
+        }
+        return;
+    }
+
+    if dump_cache {
+        let path = db_path
+            .or_else(|| {
+                cfg.cache
+                    .as_ref()
+                    .and_then(|c| c.path.as_ref())
+                    .map(PathBuf::from)
+            })
+            .unwrap_or_else(db::default_db_path);
+        match db::Db::open(&path) {
+            Ok(d) => print!("{}", d.dump()),
+            Err(e) => eprintln!("cannot open {}: {e}", path.display()),
+        }
+        return;
+    }
+
     if list_and_exit {
         let mut handles = Vec::new();
         for host in cfg.hosts.clone() {
@@ -308,6 +461,11 @@ fn main() {
             .with_inner_size([1280.0, 760.0])
             .with_title(format!("tmuxmux v{}", env!("CARGO_PKG_VERSION"))),
         renderer: eframe::Renderer::Glow,
+        // vsync makes eglSwapBuffers block on a compositor frame callback —
+        // which never arrives while the screen is locked/blanked or the
+        // window is fully occluded, freezing the whole app (PTYs included).
+        // We pace ourselves with request_repaint_after instead.
+        vsync: false,
         ..Default::default()
     };
 
@@ -317,7 +475,7 @@ fn main() {
         Box::new(move |cc| {
             cc.egui_ctx.style_mut(|s| s.visuals = egui::Visuals::dark());
             Ok(Box::new(MainApp {
-                inner: App::new(cfg),
+                inner: App::new(cfg, db_path, cache_interval),
                 script: steps,
                 script_idx: 0,
                 script_wait_until: Instant::now(),

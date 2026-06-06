@@ -1,13 +1,18 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use egui::{Color32, FontId, Pos2, Rect, Sense, Ui, Vec2};
 
 use crate::colors::{convert_bg, convert_fg, DEFAULT_BG, DEFAULT_FG, SELECTION_BG};
 use crate::config::{Config, Host};
+use crate::db::{self, Db};
 use crate::input::key_event_to_bytes;
-use crate::ssh::{build_attach_command, list_sessions, SessionListResult};
+use crate::restore::{build_restore_script, RestoreResult};
+use crate::snapshot::{spawn_snapshots, SessionSnap, SnapshotResult};
+use crate::ssh::{build_attach_command, build_new_session_command, build_shell_command};
 use crate::terminal::TerminalPane;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -16,9 +21,19 @@ pub enum Focus {
     Terminal,
 }
 
+/// A live session as shown in the sidebar.
+#[derive(Debug, Clone)]
+pub struct SessionInfo {
+    pub name: String,
+    /// Short name of the command running in it ("claude", "vim"), if any.
+    pub hint: Option<String>,
+}
+
 pub struct HostEntry {
     pub host: Host,
-    pub sessions: Vec<String>,
+    pub sessions: Vec<SessionInfo>,
+    pub closed: Vec<db::ClosedSession>,
+    pub closed_expanded: bool,
     pub loaded: bool,
     pub error: Option<String>,
     pub expanded: bool,
@@ -31,13 +46,30 @@ enum Row {
     Session(usize, usize),
     /// The "+ new" row at the end of a host's session list.
     NewSession(usize),
+    /// "⟲ closed (N)" toggle for the cached-session group.
+    ClosedToggle(usize),
+    /// One restorable cached session.
+    Closed(usize, usize),
+    /// "⟲ restore all" bulk action.
+    RestoreAll(usize),
 }
 
-/// State of the "create new session" dialog.
-pub struct NewSessionModal {
-    pub host_idx: usize,
-    pub name: String,
-    just_opened: bool,
+/// Whichever dialog is open.
+pub enum AppModal {
+    NewSession {
+        host_idx: usize,
+        name: String,
+        just_opened: bool,
+    },
+    Restore {
+        host_idx: usize,
+        name: String,
+        detail: SessionSnap,
+    },
+    RestoreAll {
+        host_idx: usize,
+        names: Vec<String>,
+    },
 }
 
 /// Pool of conflict-free default session names.
@@ -85,14 +117,23 @@ pub struct App {
 
     panes: HashMap<String, TerminalPane>,
     active_key: Option<String>,
-    listing_rx: mpsc::Receiver<SessionListResult>,
+
+    snapshot_tx: mpsc::Sender<SnapshotResult>,
+    snapshot_rx: mpsc::Receiver<SnapshotResult>,
+    restore_tx: mpsc::Sender<RestoreResult>,
+    restore_rx: mpsc::Receiver<RestoreResult>,
+    /// Hosts with a snapshot currently in flight — never double-poll a slow host.
+    in_flight: HashSet<String>,
+    db: Option<Db>,
+    poll_interval: Duration,
+    last_poll: Instant,
 
     tree_cursor: usize,
 
     pub selection: Option<Selection>,
     selecting: bool,
     clipboard: Option<arboard::Clipboard>,
-    pub modal: Option<NewSessionModal>,
+    pub modal: Option<AppModal>,
 
     layout: Option<TermLayout>,
     status: String,
@@ -100,20 +141,48 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(config: Config) -> Self {
+    pub fn new(
+        config: Config,
+        db_path_override: Option<PathBuf>,
+        interval_override: Option<u64>,
+    ) -> Self {
+        let cache_cfg = config.cache.clone().unwrap_or_default();
+        let interval_secs = interval_override
+            .or(cache_cfg.interval_secs)
+            .unwrap_or(60);
+        let retention_days = cache_cfg.retention_days.unwrap_or(30);
+        let db_path = db_path_override
+            .or_else(|| cache_cfg.path.as_ref().map(PathBuf::from))
+            .unwrap_or_else(db::default_db_path);
+
+        let db = match Db::open(&db_path) {
+            Ok(d) => {
+                log::info!("session cache: {}", db_path.display());
+                d.prune(retention_days, db::now_epoch());
+                Some(d)
+            }
+            Err(e) => {
+                log::error!("cannot open session cache {}: {e}", db_path.display());
+                None
+            }
+        };
+
         let hosts: Vec<HostEntry> = config
             .hosts
             .iter()
             .map(|h| HostEntry {
                 host: h.clone(),
                 sessions: Vec::new(),
+                closed: db
+                    .as_ref()
+                    .map(|d| d.closed_sessions(&h.name))
+                    .unwrap_or_default(),
+                closed_expanded: false,
                 loaded: false,
                 error: None,
                 expanded: true,
             })
             .collect();
-
-        let listing_rx = spawn_listing(&config.hosts);
 
         let clipboard = match arboard::Clipboard::new() {
             Ok(c) => Some(c),
@@ -123,14 +192,24 @@ impl App {
             }
         };
 
-        App {
+        let (snapshot_tx, snapshot_rx) = mpsc::channel();
+        let (restore_tx, restore_rx) = mpsc::channel();
+
+        let mut app = App {
             config,
             hosts,
             focus: Focus::Tree,
             show_sidebar: true,
             panes: HashMap::new(),
             active_key: None,
-            listing_rx,
+            snapshot_tx,
+            snapshot_rx,
+            restore_tx,
+            restore_rx,
+            in_flight: HashSet::new(),
+            db,
+            poll_interval: Duration::from_secs(interval_secs),
+            last_poll: Instant::now(),
             tree_cursor: 0,
             selection: None,
             selecting: false,
@@ -139,30 +218,116 @@ impl App {
             layout: None,
             status: "loading sessions...".into(),
             font_size: 14.0,
+        };
+        app.poll_now();
+        app
+    }
+
+    // ---------- snapshot polling ----------
+
+    /// Snapshot every host that isn't already being polled.
+    pub fn poll_now(&mut self) {
+        let due: Vec<Host> = self
+            .config
+            .hosts
+            .iter()
+            .filter(|h| !self.in_flight.contains(&h.name))
+            .cloned()
+            .collect();
+        for h in &due {
+            self.in_flight.insert(h.name.clone());
+        }
+        self.last_poll = Instant::now();
+        spawn_snapshots(due, self.snapshot_tx.clone());
+    }
+
+    /// Called every frame: kick scheduled polls, absorb results.
+    pub fn check_results(&mut self) {
+        if !self.poll_interval.is_zero() && self.last_poll.elapsed() >= self.poll_interval {
+            self.poll_now();
+        }
+
+        while let Ok(result) = self.snapshot_rx.try_recv() {
+            self.apply_snapshot_result(result);
+        }
+
+        while let Ok(result) = self.restore_rx.try_recv() {
+            self.apply_restore_result(result);
         }
     }
 
-    // ---------- session listing ----------
+    fn apply_snapshot_result(&mut self, result: SnapshotResult) {
+        self.in_flight.remove(&result.host_name);
+        let now = db::now_epoch();
+        let Some(entry) = self
+            .hosts
+            .iter_mut()
+            .find(|e| e.host.name == result.host_name)
+        else {
+            return;
+        };
+        entry.loaded = true;
+        if let Some(err) = result.error {
+            // Unreachable host: keep showing the last known sessions.
+            entry.error = Some(err);
+        } else {
+            entry.error = None;
+            entry.sessions = result
+                .sessions
+                .iter()
+                .map(|s| SessionInfo {
+                    name: s.name.clone(),
+                    hint: session_hint(s),
+                })
+                .collect();
+            if let Some(db) = self.db.as_mut() {
+                if let Err(e) = db.apply_snapshot(&result.host_name, &result.sessions, now) {
+                    log::error!("cache write failed for {}: {e}", result.host_name);
+                }
+                entry.closed = db.closed_sessions(&result.host_name);
+            }
+        }
+        if self.hosts.iter().all(|e| e.loaded) && self.status == "loading sessions..." {
+            self.status = "ready".into();
+        }
+    }
 
-    pub fn check_listing_results(&mut self) {
-        while let Ok(result) = self.listing_rx.try_recv() {
-            if let Some(entry) = self.hosts.iter_mut().find(|e| e.host.name == result.host_name) {
-                entry.sessions = result.sessions;
-                entry.error = result.error;
-                entry.loaded = true;
+    fn apply_restore_result(&mut self, result: RestoreResult) {
+        if let Some(err) = result.error {
+            self.status = format!("restore {} failed: {}", result.session_name, err);
+            return;
+        }
+        let now = db::now_epoch();
+        if let Some(db) = self.db.as_ref() {
+            db.mark_alive(&result.host_name, &result.session_name, now);
+        }
+        if let Some(entry) = self
+            .hosts
+            .iter_mut()
+            .find(|e| e.host.name == result.host_name)
+        {
+            if !entry.sessions.iter().any(|s| s.name == result.session_name) {
+                entry.sessions.push(SessionInfo {
+                    name: result.session_name.clone(),
+                    hint: None,
+                });
             }
-            if self.hosts.iter().all(|e| e.loaded) {
-                self.status = "ready".into();
-            }
+            entry.closed.retain(|c| c.name != result.session_name);
+        }
+        self.status = format!("restored {}/{}", result.host_name, result.session_name);
+        if result.attach {
+            let (h, s) = (result.host_name, result.session_name);
+            self.activate_session(&h, &s);
         }
     }
 
     pub fn refresh_all(&mut self) {
-        for entry in &mut self.hosts {
-            entry.loaded = false;
-        }
         self.status = "refreshing...".into();
-        self.listing_rx = spawn_listing(&self.config.hosts);
+        self.poll_now();
+    }
+
+    pub fn host_index(&self, name: &str) -> Option<usize> {
+        self.hosts.iter().position(|e| e.host.name == name)
     }
 
     // ---------- pane management ----------
@@ -218,21 +383,26 @@ impl App {
         self.status = key;
     }
 
-    // ---------- new-session modal ----------
+    // ---------- modals ----------
 
-    /// First name from the pool not already used on this host; falls back to
-    /// numbered variants if someone has thirty sessions of colours.
+    /// First name from the pool not used by a live *or* cached session on
+    /// this host (a clash with a cached one would overwrite its history);
+    /// falls back to numbered variants.
     fn default_session_name(&self, host_idx: usize) -> String {
-        let used = &self.hosts[host_idx].sessions;
+        let entry = &self.hosts[host_idx];
+        let taken = |candidate: &str| {
+            entry.sessions.iter().any(|s| s.name == candidate)
+                || entry.closed.iter().any(|c| c.name == candidate)
+        };
         for name in NAME_POOL {
-            if !used.iter().any(|s| s == name) {
+            if !taken(name) {
                 return (*name).to_string();
             }
         }
         for n in 2.. {
             for name in NAME_POOL {
                 let candidate = format!("{name}-{n}");
-                if !used.iter().any(|s| s == &candidate) {
+                if !taken(&candidate) {
                     return candidate;
                 }
             }
@@ -242,7 +412,7 @@ impl App {
 
     pub fn open_new_session_modal(&mut self, host_idx: usize) {
         let name = self.default_session_name(host_idx);
-        self.modal = Some(NewSessionModal {
+        self.modal = Some(AppModal::NewSession {
             host_idx,
             name,
             just_opened: true,
@@ -257,29 +427,136 @@ impl App {
         }
     }
 
-    /// Create the session named in the modal and attach to it.
+    pub fn open_restore_modal(&mut self, host_idx: usize, name: &str) {
+        let host_name = self.hosts[host_idx].host.name.clone();
+        let detail = self
+            .db
+            .as_ref()
+            .and_then(|d| d.session_detail(&host_name, name));
+        match detail {
+            Some(detail) => {
+                self.modal = Some(AppModal::Restore {
+                    host_idx,
+                    name: name.to_string(),
+                    detail,
+                });
+            }
+            None => self.status = format!("no cached detail for {host_name}/{name}"),
+        }
+    }
+
+    pub fn open_restore_all_modal(&mut self, host_idx: usize) {
+        let names: Vec<String> = self.hosts[host_idx]
+            .closed
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        if names.is_empty() {
+            return;
+        }
+        self.modal = Some(AppModal::RestoreAll { host_idx, names });
+    }
+
+    /// Confirm whichever dialog is open.
     pub fn accept_modal(&mut self) {
         let Some(modal) = self.modal.take() else {
             return;
         };
-        // tmux session names may not contain ':' or '.'.
-        let name: String = modal
-            .name
-            .trim()
-            .replace([':', '.'], "-")
-            .replace(char::is_whitespace, "-");
-        if name.is_empty() {
-            self.status = "session name empty — cancelled".into();
+        match modal {
+            AppModal::NewSession {
+                host_idx, name, ..
+            } => {
+                // tmux session names may not contain ':' or '.'.
+                let name: String = name
+                    .trim()
+                    .replace([':', '.'], "-")
+                    .replace(char::is_whitespace, "-");
+                if name.is_empty() {
+                    self.status = "session name empty — cancelled".into();
+                    return;
+                }
+                let host = self.config.hosts[host_idx].clone();
+                let cmd = build_new_session_command(&host, &name);
+                self.open_pane(&host, &name, cmd);
+                // Show it in the sidebar immediately; the next poll confirms it.
+                let entry = &mut self.hosts[host_idx];
+                if !entry.sessions.iter().any(|s| s.name == name) {
+                    entry.sessions.push(SessionInfo { name, hint: None });
+                }
+            }
+            AppModal::Restore {
+                host_idx, name, ..
+            } => {
+                self.restore_sessions(host_idx, vec![name], true);
+            }
+            AppModal::RestoreAll { host_idx, names } => {
+                self.restore_sessions(host_idx, names, false);
+            }
+        }
+    }
+
+    /// Recreate cached sessions on their host in a background thread.
+    /// Attaches to the (single) session when `attach` is set.
+    pub fn restore_sessions(&mut self, host_idx: usize, names: Vec<String>, attach: bool) {
+        let host = self.config.hosts[host_idx].clone();
+        let Some(db) = self.db.as_ref() else {
+            self.status = "session cache unavailable".into();
+            return;
+        };
+        let mut jobs: Vec<(String, Vec<String>)> = Vec::new();
+        for name in names {
+            match db.session_detail(&host.name, &name) {
+                Some(detail) => {
+                    let script = build_restore_script(&detail);
+                    jobs.push((name, build_shell_command(&host, &script)));
+                }
+                None => log::warn!("no cached detail for {}/{name}", host.name),
+            }
+        }
+        if jobs.is_empty() {
+            self.status = "nothing to restore".into();
             return;
         }
-        let host = self.config.hosts[modal.host_idx].clone();
-        let cmd = crate::ssh::build_new_session_command(&host, &name);
-        self.open_pane(&host, &name, cmd);
-        // Show it in the sidebar immediately; the next refresh confirms it.
-        let entry = &mut self.hosts[modal.host_idx];
-        if !entry.sessions.iter().any(|s| s == &name) {
-            entry.sessions.push(name);
+        self.status = format!("restoring {} session(s) on {}...", jobs.len(), host.name);
+        let tx = self.restore_tx.clone();
+        let host_name = host.name.clone();
+        thread::spawn(move || {
+            for (name, argv) in jobs {
+                let mut cmd = std::process::Command::new(&argv[0]);
+                cmd.args(&argv[1..]);
+                let error = match cmd.output() {
+                    Ok(out) if out.status.success() => None,
+                    Ok(out) => {
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        let stdout = String::from_utf8_lossy(&out.stdout);
+                        Some(
+                            stderr
+                                .lines()
+                                .chain(stdout.lines())
+                                .last()
+                                .unwrap_or("failed")
+                                .to_string(),
+                        )
+                    }
+                    Err(e) => Some(e.to_string()),
+                };
+                let _ = tx.send(RestoreResult {
+                    host_name: host_name.clone(),
+                    session_name: name,
+                    attach,
+                    error,
+                });
+            }
+        });
+    }
+
+    pub fn delete_cached_session(&mut self, host_idx: usize, name: &str) {
+        let host_name = self.hosts[host_idx].host.name.clone();
+        if let Some(db) = self.db.as_ref() {
+            db.delete_session(&host_name, name);
         }
+        self.hosts[host_idx].closed.retain(|c| c.name != name);
+        self.status = format!("forgot {host_name}/{name}");
     }
 
     pub fn active_pane_mut(&mut self) -> Option<&mut TerminalPane> {
@@ -303,7 +580,7 @@ impl App {
             .flat_map(|e| {
                 e.sessions
                     .iter()
-                    .map(|s| (e.host.name.clone(), s.clone()))
+                    .map(|s| (e.host.name.clone(), s.name.clone()))
                     .collect::<Vec<_>>()
             })
             .collect();
@@ -567,6 +844,17 @@ impl App {
                 if entry.loaded && entry.error.is_none() {
                     rows.push(Row::NewSession(hi));
                 }
+                if !entry.closed.is_empty() {
+                    rows.push(Row::ClosedToggle(hi));
+                    if entry.closed_expanded {
+                        for ci in 0..entry.closed.len() {
+                            rows.push(Row::Closed(hi, ci));
+                        }
+                        if entry.closed.len() > 1 {
+                            rows.push(Row::RestoreAll(hi));
+                        }
+                    }
+                }
             }
         }
         rows
@@ -589,24 +877,37 @@ impl App {
                 Row::Host(hi) | Row::NewSession(hi) => {
                     self.hosts[hi].expanded = false;
                 }
+                Row::ClosedToggle(hi) | Row::Closed(hi, _) | Row::RestoreAll(hi) => {
+                    self.hosts[hi].closed_expanded = false;
+                }
                 Row::Session(..) => {}
             },
-            egui::Key::ArrowRight => {
-                if let Row::Host(hi) = rows[self.tree_cursor] {
-                    self.hosts[hi].expanded = true;
-                }
-            }
+            egui::Key::ArrowRight => match rows[self.tree_cursor] {
+                Row::Host(hi) => self.hosts[hi].expanded = true,
+                Row::ClosedToggle(hi) => self.hosts[hi].closed_expanded = true,
+                _ => {}
+            },
             egui::Key::Enter => match rows[self.tree_cursor] {
                 Row::Host(hi) => {
                     self.hosts[hi].expanded = !self.hosts[hi].expanded;
                 }
                 Row::Session(hi, si) => {
                     let h = self.hosts[hi].host.name.clone();
-                    let s = self.hosts[hi].sessions[si].clone();
+                    let s = self.hosts[hi].sessions[si].name.clone();
                     self.activate_session(&h, &s);
                 }
                 Row::NewSession(hi) => {
                     self.open_new_session_modal(hi);
+                }
+                Row::ClosedToggle(hi) => {
+                    self.hosts[hi].closed_expanded = !self.hosts[hi].closed_expanded;
+                }
+                Row::Closed(hi, ci) => {
+                    let name = self.hosts[hi].closed[ci].name.clone();
+                    self.open_restore_modal(hi, &name);
+                }
+                Row::RestoreAll(hi) => {
+                    self.open_restore_all_modal(hi);
                 }
             },
             _ => {}
@@ -626,12 +927,15 @@ impl App {
         let rows = self.visible_rows();
         let mut pending: Option<(String, String)> = None;
         let mut toggle: Option<usize> = None;
+        let mut toggle_closed: Option<usize> = None;
         let mut new_modal: Option<usize> = None;
+        let mut restore_one: Option<(usize, String)> = None;
+        let mut restore_all: Option<usize> = None;
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             for (i, row) in rows.iter().enumerate() {
                 let is_cursor = self.focus == Focus::Tree && self.tree_cursor == i;
-                let (label, indent, color, is_active) = match row {
+                let (label, hint, indent, color, is_active) = match row {
                     Row::Host(hi) => {
                         let e = &self.hosts[hi.to_owned()];
                         let arrow = if e.expanded { "▾" } else { "▸" };
@@ -647,21 +951,71 @@ impl App {
                         } else {
                             Color32::from_rgb(90, 200, 250)
                         };
-                        (format!("{arrow} {}{suffix}", e.host.name), 6.0, color, false)
+                        (
+                            format!("{arrow} {}{suffix}", e.host.name),
+                            None,
+                            6.0,
+                            color,
+                            false,
+                        )
                     }
                     Row::Session(hi, si) => {
                         let e = &self.hosts[*hi];
-                        let key = format!("{}/{}", e.host.name, e.sessions[*si]);
+                        let s = &e.sessions[*si];
+                        let key = format!("{}/{}", e.host.name, s.name);
                         let active = self.active_key.as_deref() == Some(key.as_str());
                         let color = if active {
                             Color32::from_rgb(140, 235, 140)
                         } else {
                             Color32::from_gray(220)
                         };
-                        (e.sessions[*si].clone(), 24.0, color, active)
+                        (s.name.clone(), s.hint.clone(), 24.0, color, active)
                     }
-                    Row::NewSession(_) => {
-                        ("+ new".to_string(), 24.0, Color32::from_gray(130), false)
+                    Row::NewSession(_) => (
+                        "+ new".to_string(),
+                        None,
+                        24.0,
+                        Color32::from_gray(130),
+                        false,
+                    ),
+                    Row::ClosedToggle(hi) => {
+                        let e = &self.hosts[*hi];
+                        let arrow = if e.closed_expanded { "▾" } else { "▸" };
+                        (
+                            format!("{arrow} ⟲ closed ({})", e.closed.len()),
+                            None,
+                            24.0,
+                            Color32::from_rgb(150, 130, 90),
+                            false,
+                        )
+                    }
+                    Row::Closed(hi, ci) => {
+                        let c = &self.hosts[*hi].closed[ci.to_owned()];
+                        let age = c
+                            .closed_at
+                            .map(|t| friendly_age(db::now_epoch() - t))
+                            .unwrap_or_default();
+                        let hint = match &c.hint {
+                            Some(h) => format!("{h} · {age}"),
+                            None => age,
+                        };
+                        (
+                            format!("⟲ {}", c.name),
+                            Some(hint),
+                            36.0,
+                            Color32::from_gray(150),
+                            false,
+                        )
+                    }
+                    Row::RestoreAll(hi) => {
+                        let n = self.hosts[*hi].closed.len();
+                        (
+                            format!("⟲ restore all ({n})"),
+                            None,
+                            36.0,
+                            Color32::from_rgb(150, 130, 90),
+                            false,
+                        )
                     }
                 };
 
@@ -676,13 +1030,22 @@ impl App {
                 } else if response.hovered() {
                     ui.painter().rect_filled(rect, 3.0, Color32::from_gray(45));
                 }
-                ui.painter().text(
+                let text_rect = ui.painter().text(
                     rect.left_center() + Vec2::new(indent, 0.0),
                     egui::Align2::LEFT_CENTER,
                     &label,
                     FontId::monospace(13.0),
                     color,
                 );
+                if let Some(hint) = hint {
+                    ui.painter().text(
+                        egui::pos2(text_rect.right() + 10.0, rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        truncate(&hint, 14),
+                        FontId::monospace(11.0),
+                        Color32::from_gray(110),
+                    );
+                }
 
                 if response.clicked() {
                     self.tree_cursor = i;
@@ -690,9 +1053,16 @@ impl App {
                         Row::Host(hi) => toggle = Some(*hi),
                         Row::Session(hi, si) => {
                             let e = &self.hosts[*hi];
-                            pending = Some((e.host.name.clone(), e.sessions[*si].clone()));
+                            pending =
+                                Some((e.host.name.clone(), e.sessions[*si].name.clone()));
                         }
                         Row::NewSession(hi) => new_modal = Some(*hi),
+                        Row::ClosedToggle(hi) => toggle_closed = Some(*hi),
+                        Row::Closed(hi, ci) => {
+                            restore_one =
+                                Some((*hi, self.hosts[*hi].closed[*ci].name.clone()));
+                        }
+                        Row::RestoreAll(hi) => restore_all = Some(*hi),
                     }
                 }
             }
@@ -701,46 +1071,136 @@ impl App {
         if let Some(hi) = toggle {
             self.hosts[hi].expanded = !self.hosts[hi].expanded;
         }
+        if let Some(hi) = toggle_closed {
+            self.hosts[hi].closed_expanded = !self.hosts[hi].closed_expanded;
+        }
         if let Some((h, s)) = pending {
             self.activate_session(&h, &s);
         }
         if let Some(hi) = new_modal {
             self.open_new_session_modal(hi);
         }
+        if let Some((hi, name)) = restore_one {
+            self.open_restore_modal(hi, &name);
+        }
+        if let Some(hi) = restore_all {
+            self.open_restore_all_modal(hi);
+        }
     }
 
-    /// The "create new session" dialog. Rendered last so it sits on top.
+    /// Whichever dialog is open. Rendered last so it sits on top.
     pub fn render_modal(&mut self, ctx: &egui::Context) {
-        let Some(host_idx) = self.modal.as_ref().map(|m| m.host_idx) else {
+        let Some(modal) = self.modal.as_mut() else {
             return;
         };
+        let host_idx = match modal {
+            AppModal::NewSession { host_idx, .. }
+            | AppModal::Restore { host_idx, .. }
+            | AppModal::RestoreAll { host_idx, .. } => *host_idx,
+        };
         let host_name = self.hosts[host_idx].host.name.clone();
-        let modal_state = self.modal.as_mut().unwrap();
         let mut accept = false;
         let mut cancel = false;
+        let mut forget: Option<String> = None;
 
-        let response = egui::Modal::new(egui::Id::new("new_session_modal")).show(ctx, |ui| {
-            ui.set_width(320.0);
-            ui.heading(format!("new session on {host_name}"));
-            ui.add_space(8.0);
-            let edit = ui.add(
-                egui::TextEdit::singleline(&mut modal_state.name)
-                    .hint_text("session name")
-                    .desired_width(f32::INFINITY),
-            );
-            if modal_state.just_opened {
-                modal_state.just_opened = false;
-                edit.request_focus();
+        let response = egui::Modal::new(egui::Id::new("tmuxmux_modal")).show(ctx, |ui| {
+            ui.set_width(380.0);
+            match modal {
+                AppModal::NewSession {
+                    name, just_opened, ..
+                } => {
+                    ui.heading(format!("new session on {host_name}"));
+                    ui.add_space(8.0);
+                    let edit = ui.add(
+                        egui::TextEdit::singleline(name)
+                            .hint_text("session name")
+                            .desired_width(f32::INFINITY),
+                    );
+                    if *just_opened {
+                        *just_opened = false;
+                        edit.request_focus();
+                    }
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("create").clicked() {
+                            accept = true;
+                        }
+                        if ui.button("cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                }
+                AppModal::Restore { name, detail, .. } => {
+                    ui.heading(format!("restore '{name}' on {host_name}"));
+                    ui.add_space(6.0);
+                    ui.colored_label(
+                        Color32::from_gray(150),
+                        "recreates windows, panes and working directories,\nand re-runs the commands that were running:",
+                    );
+                    ui.add_space(6.0);
+                    for p in &detail.panes {
+                        let cmd = p
+                            .cmdline
+                            .as_deref()
+                            .map(|c| format!("$ {}", truncate(c, 40)))
+                            .unwrap_or_else(|| "(shell)".to_string());
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "  {}:{}  {}  {}",
+                                p.window_index,
+                                p.pane_index,
+                                truncate(&p.cwd, 26),
+                                cmd
+                            ))
+                            .monospace()
+                            .size(12.0)
+                            .color(Color32::from_gray(190)),
+                        );
+                    }
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("restore & attach").clicked() {
+                            accept = true;
+                        }
+                        if ui.button("forget").clicked() {
+                            forget = Some(name.clone());
+                        }
+                        if ui.button("cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                }
+                AppModal::RestoreAll { names, .. } => {
+                    ui.heading(format!(
+                        "restore {} sessions on {host_name}",
+                        names.len()
+                    ));
+                    ui.add_space(6.0);
+                    for name in names.iter().take(12) {
+                        ui.label(
+                            egui::RichText::new(format!("  ⟲ {name}"))
+                                .monospace()
+                                .size(12.0)
+                                .color(Color32::from_gray(190)),
+                        );
+                    }
+                    if names.len() > 12 {
+                        ui.colored_label(
+                            Color32::from_gray(140),
+                            format!("  … and {} more", names.len() - 12),
+                        );
+                    }
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.button(format!("restore all {}", names.len())).clicked() {
+                            accept = true;
+                        }
+                        if ui.button("cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                }
             }
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                if ui.button("create").clicked() {
-                    accept = true;
-                }
-                if ui.button("cancel").clicked() {
-                    cancel = true;
-                }
-            });
             if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 accept = true;
             }
@@ -754,6 +1214,9 @@ impl App {
 
         if accept {
             self.accept_modal();
+        } else if let Some(name) = forget {
+            self.modal = None;
+            self.delete_cached_session(host_idx, &name);
         } else if cancel {
             self.modal = None;
         }
@@ -1002,7 +1465,7 @@ impl App {
             center + Vec2::new(0.0, 34.0),
             egui::Align2::CENTER_CENTER,
             "↑↓ navigate · Enter connect · F2 sidebar · F5 refresh · Ctrl+]/\\ cycle",
-            FontId::proportional(13.0),
+            FontId::monospace(13.0), // the proportional font lacks arrow glyphs
             Color32::from_gray(110),
         );
     }
@@ -1293,16 +1756,14 @@ fn encode_mouse(button: u8, col: usize, row: usize, pressed: bool, sgr: bool) ->
     }
 }
 
-fn spawn_listing(hosts: &[Host]) -> mpsc::Receiver<SessionListResult> {
-    let (tx, rx) = mpsc::channel();
-    // One thread per host so a slow tunnel doesn't serialize the others.
-    for host in hosts.iter().cloned() {
-        let tx = tx.clone();
-        thread::spawn(move || {
-            let _ = tx.send(list_sessions(host));
-        });
-    }
-    rx
+/// Sidebar hint for a live session: the short name of the first pane that's
+/// running something other than a bare shell.
+fn session_hint(s: &SessionSnap) -> Option<String> {
+    s.panes
+        .iter()
+        .find(|p| p.cmdline.is_some())
+        .map(|p| p.command.clone())
+        .filter(|c| !c.is_empty())
 }
 
 fn merge_env(
@@ -1320,6 +1781,15 @@ fn merge_env(
             }
             Some(merged)
         }
+    }
+}
+
+fn friendly_age(secs: i64) -> String {
+    match secs {
+        i64::MIN..=59 => "now".into(),
+        60..=3599 => format!("{}m", secs / 60),
+        3600..=86399 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86400),
     }
 }
 

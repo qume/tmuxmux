@@ -15,12 +15,28 @@ pub struct Host {
     pub env: Option<HashMap<String, String>>,
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct CacheConfig {
+    /// Seconds between background snapshots of every host's sessions.
+    /// 0 disables periodic polling (startup + F5 still snapshot).
+    #[serde(default)]
+    pub interval_secs: Option<u64>,
+    /// Closed sessions are forgotten after this many days.
+    #[serde(default)]
+    pub retention_days: Option<i64>,
+    /// Override the sqlite file location.
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub hosts: Vec<Host>,
     #[serde(default)]
     pub env: Option<HashMap<String, String>>,
+    #[serde(default)]
+    pub cache: Option<CacheConfig>,
 }
 
 pub fn find_config_path(explicit: Option<PathBuf>) -> Option<PathBuf> {

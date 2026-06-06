@@ -29,3 +29,11 @@ command = "sshpass -p secret ssh -tt -o ProxyCommand='cloudflared access ssh --h
 
 # [env]
 # TERM = "xterm-256color"
+
+# Session cache (all optional — these are the defaults). Hosts are
+# snapshotted on this interval into a local sqlite db so closed sessions
+# (or a whole rebooted VM) can be restored from the sidebar.
+# [cache]
+# interval_secs = 60
+# retention_days = 30
+# path = "~/.local/share/tmuxmux/sessions.db"   # default location

@@ -66,6 +66,25 @@ pub fn build_attach_command(host: &Host, session: &str) -> Vec<String> {
     }
 }
 
+/// Run an arbitrary shell command line on the host: locally via `sh -c`,
+/// remotely by handing the string to ssh (the remote shell parses it).
+/// Quoting inside `script` is the caller's responsibility.
+pub fn build_shell_command(host: &Host, script: &str) -> Vec<String> {
+    if host.local {
+        vec!["sh".into(), "-c".into(), script.to_string()]
+    } else if let Some(ref raw) = host.command {
+        let mut parts = shlex_like_split(raw);
+        parts.push(script.to_string());
+        parts
+    } else {
+        let mut parts = vec!["ssh".to_string()];
+        parts.extend(SSH_OPTS.iter().map(|s| s.to_string()));
+        parts.push(ssh_target(host));
+        parts.push(script.to_string());
+        parts
+    }
+}
+
 /// Command that creates-or-attaches a session in one shot. `new-session -A`
 /// attaches when the name already exists, so there's no separate round-trip
 /// (and no race) between creating and attaching.
