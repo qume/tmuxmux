@@ -114,6 +114,7 @@ prints everything the cache knows and exits.
 | `Ctrl+click` | open URL under cursor |
 | `Ctrl+]` / `Ctrl+\` | next / previous session |
 | `Ctrl+Shift+E` | focus the session tree |
+| `Ctrl+=` / `Ctrl+-` | bigger / smaller font (`Ctrl+0` resets) |
 | `F2` | toggle sidebar |
 | `F5` | refresh session lists |
 | `Ctrl+Shift+Q` | quit |

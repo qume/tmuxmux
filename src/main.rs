@@ -46,6 +46,7 @@ enum Step {
     PrintClipboard,
     NewModal(String),
     ModalAccept,
+    Font(f32),
     SnapshotNow,
     Restore(String, String),
     RestoreModal(String, String),
@@ -90,6 +91,7 @@ fn parse_script(s: &str) -> Vec<Step> {
             "paste" => Some(Step::Paste),
             "newmodal" => Some(Step::NewModal(arg.trim().to_string())),
             "modal-accept" => Some(Step::ModalAccept),
+            "font" => arg.trim().parse().ok().map(Step::Font),
             "snapshot-now" => Some(Step::SnapshotNow),
             "restore" => arg
                 .trim()
@@ -235,6 +237,7 @@ impl MainApp {
                 }
                 Step::NewModal(h) => self.inner.open_new_session_modal_by_host(&h),
                 Step::ModalAccept => self.inner.accept_modal(),
+                Step::Font(n) => self.inner.set_font_for_test(n),
                 Step::SnapshotNow => self.inner.poll_now(),
                 Step::Restore(h, s) => match self.inner.host_index(&h) {
                     Some(hi) => self.inner.restore_sessions(hi, vec![s], true),

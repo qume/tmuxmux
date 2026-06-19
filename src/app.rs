@@ -330,6 +330,27 @@ impl App {
         self.hosts.iter().position(|e| e.host.name == name)
     }
 
+    fn adjust_font(&mut self, delta: f32) {
+        self.set_font(self.font_size + delta);
+    }
+
+    /// Test hook (mirrors the Ctrl+=/Ctrl+- keybinding path).
+    pub fn set_font_for_test(&mut self, size: f32) {
+        self.set_font(size);
+    }
+
+    pub fn font_size(&self) -> f32 {
+        self.font_size
+    }
+
+    fn set_font(&mut self, size: f32) {
+        let clamped = size.clamp(7.0, 40.0);
+        if clamped != self.font_size {
+            self.font_size = clamped;
+            self.status = format!("font size {}", clamped as i32);
+        }
+    }
+
     // ---------- pane management ----------
 
     pub fn read_all_panes(&mut self) -> bool {
@@ -734,6 +755,22 @@ impl App {
                     if mods.ctrl && mods.shift && *key == egui::Key::E {
                         self.focus = Focus::Tree;
                         self.show_sidebar = true;
+                        continue;
+                    }
+                    // Font size: Ctrl+= / Ctrl++ bigger, Ctrl+- smaller,
+                    // Ctrl+0 reset. (Shift makes '=' into '+', so accept both.)
+                    if mods.ctrl
+                        && (*key == egui::Key::Equals || *key == egui::Key::Plus)
+                    {
+                        self.adjust_font(1.0);
+                        continue;
+                    }
+                    if mods.ctrl && *key == egui::Key::Minus {
+                        self.adjust_font(-1.0);
+                        continue;
+                    }
+                    if mods.ctrl && *key == egui::Key::Num0 {
+                        self.set_font(14.0);
                         continue;
                     }
                     match self.focus {
@@ -1671,7 +1708,7 @@ impl App {
                 ui.add_space(6.0);
                 ui.colored_label(
                     Color32::from_gray(120),
-                    "drag:select  C-S-c:copy  C-S-v:paste  C-]/\\:cycle  C-S-e:tree  F2:sidebar  F5:refresh  C-S-q:quit",
+                    "drag:select  C-S-c:copy  C-S-v:paste  C-]/\\:cycle  C-S-e:tree  C-+/-:font  F2:sidebar  F5:refresh  C-S-q:quit",
                 );
             });
         });
