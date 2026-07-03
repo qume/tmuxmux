@@ -199,6 +199,7 @@ impl Db {
                     command: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
                     cmdline: r.get(5)?,
                     cwd: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                    active: false,
                 })
             })
             .ok()?

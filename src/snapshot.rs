@@ -30,6 +30,8 @@ pub struct PaneSnap {
     /// Full command line of the foreground program, when it isn't a bare shell.
     pub cmdline: Option<String>,
     pub cwd: String,
+    /// Whether this is the focused pane of its window.
+    pub active: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -50,7 +52,7 @@ pub struct SnapshotResult {
 /// without a tmux server parses as "no sessions" rather than a failure.
 fn snapshot_command() -> String {
     format!(
-        "tmux list-panes -a -F '#{{session_name}}{s}#{{session_created}}{s}#{{window_index}}{s}#{{window_name}}{s}#{{window_layout}}{s}#{{pane_index}}{s}#{{pane_pid}}{s}#{{pane_current_command}}{s}#{{pane_current_path}}' 2>&1; echo {m}; ps -eo ppid=,pid=,args= 2>/dev/null",
+        "tmux list-panes -a -F '#{{session_name}}{s}#{{session_created}}{s}#{{window_index}}{s}#{{window_name}}{s}#{{window_layout}}{s}#{{pane_index}}{s}#{{pane_pid}}{s}#{{pane_current_command}}{s}#{{pane_current_path}}{s}#{{pane_active}}' 2>&1; echo {m}; ps -eo ppid=,pid=,args= 2>/dev/null",
         s = SEP,
         m = PS_MARKER
     )
@@ -126,7 +128,7 @@ fn parse_snapshot(pane_part: &str, ps_part: &str) -> Vec<SessionSnap> {
     let mut sessions: Vec<SessionSnap> = Vec::new();
     for line in pane_part.lines() {
         let fields: Vec<&str> = line.split(SEP).collect();
-        if fields.len() != 9 {
+        if fields.len() != 10 {
             continue;
         }
         let name = fields[0].to_string();
@@ -140,6 +142,7 @@ fn parse_snapshot(pane_part: &str, ps_part: &str) -> Vec<SessionSnap> {
             command: fields[7].to_string(),
             cmdline: pane_cmdline(pane_pid, fields[7], &procs, &children),
             cwd: fields[8].to_string(),
+            active: fields[9].trim() == "1",
         };
         match sessions.iter_mut().find(|s| s.name == name) {
             Some(s) => s.panes.push(pane),

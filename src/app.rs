@@ -10,8 +10,9 @@ use crate::colors::{convert_bg, convert_fg, DEFAULT_BG, DEFAULT_FG, SELECTION_BG
 use crate::config::{Config, Host};
 use crate::db::{self, Db};
 use crate::input::key_event_to_bytes;
+use crate::progresslog::{spawn_fetch, LogResult};
 use crate::restore::{build_restore_script, RestoreResult};
-use crate::snapshot::{spawn_snapshots, SessionSnap, SnapshotResult};
+use crate::snapshot::{spawn_snapshots, PaneSnap, SessionSnap, SnapshotResult};
 use crate::ssh::{build_attach_command, build_new_session_command, build_shell_command};
 use crate::terminal::TerminalPane;
 
@@ -27,6 +28,8 @@ pub struct SessionInfo {
     pub name: String,
     /// Short name of the command running in it ("claude", "vim"), if any.
     pub hint: Option<String>,
+    /// Working directory of the focused pane — where we look for the log.
+    pub cwd: Option<String>,
 }
 
 pub struct HostEntry {
@@ -128,6 +131,20 @@ pub struct App {
     poll_interval: Duration,
     last_poll: Instant,
 
+    // Narrative progress log (right-hand pane).
+    log_tx: mpsc::Sender<LogResult>,
+    log_rx: mpsc::Receiver<LogResult>,
+    log_enabled: bool,
+    log_filename: String,
+    log_content: Option<String>,
+    log_path: Option<String>,
+    log_mtime: Option<i64>,
+    /// (host, session) the current log content belongs to.
+    log_for: Option<(String, String)>,
+    log_in_flight: bool,
+    log_hidden: bool,
+    last_log_fetch: Instant,
+
     tree_cursor: usize,
 
     pub selection: Option<Selection>,
@@ -194,6 +211,9 @@ impl App {
 
         let (snapshot_tx, snapshot_rx) = mpsc::channel();
         let (restore_tx, restore_rx) = mpsc::channel();
+        let (log_tx, log_rx) = mpsc::channel();
+
+        let log_cfg = config.log.clone().unwrap_or_default();
 
         let mut app = App {
             config,
@@ -210,6 +230,17 @@ impl App {
             db,
             poll_interval: Duration::from_secs(interval_secs),
             last_poll: Instant::now(),
+            log_tx,
+            log_rx,
+            log_enabled: log_cfg.enabled(),
+            log_filename: log_cfg.filename(),
+            log_content: None,
+            log_path: None,
+            log_mtime: None,
+            log_for: None,
+            log_in_flight: false,
+            log_hidden: false,
+            last_log_fetch: Instant::now(),
             tree_cursor: 0,
             selection: None,
             selecting: false,
@@ -254,6 +285,89 @@ impl App {
         while let Ok(result) = self.restore_rx.try_recv() {
             self.apply_restore_result(result);
         }
+
+        while let Ok(result) = self.log_rx.try_recv() {
+            self.apply_log_result(result);
+        }
+        self.maybe_fetch_log();
+    }
+
+    // ---------- progress log ----------
+
+    /// Fetch the active session's log on a timer (and whenever the active
+    /// session changes). Cheap no-op when there's no active session.
+    fn maybe_fetch_log(&mut self) {
+        if !self.log_enabled || self.log_in_flight {
+            return;
+        }
+        let Some(key) = self.active_key.clone() else {
+            return;
+        };
+        let Some((host_name, session_name)) = key.split_once('/') else {
+            return;
+        };
+        // Only re-poll every few seconds once we already have this session's log.
+        let same = self
+            .log_for
+            .as_ref()
+            .map(|(h, s)| h == host_name && s == session_name)
+            .unwrap_or(false);
+        if same && self.last_log_fetch.elapsed() < Duration::from_secs(4) {
+            return;
+        }
+        let Some(entry) = self.hosts.iter().find(|e| e.host.name == host_name) else {
+            return;
+        };
+        let cwd = entry
+            .sessions
+            .iter()
+            .find(|s| s.name == session_name)
+            .and_then(|s| s.cwd.clone());
+        let Some(cwd) = cwd else {
+            return; // no cwd known yet; wait for the next snapshot
+        };
+        self.log_in_flight = true;
+        self.last_log_fetch = Instant::now();
+        spawn_fetch(
+            entry.host.clone(),
+            session_name.to_string(),
+            cwd,
+            self.log_filename.clone(),
+            self.log_tx.clone(),
+        );
+    }
+
+    fn apply_log_result(&mut self, result: LogResult) {
+        self.log_in_flight = false;
+        // Ignore results for a session we've since navigated away from.
+        let matches_active = self
+            .active_key
+            .as_deref()
+            .and_then(|k| k.split_once('/'))
+            .map(|(h, s)| h == result.host_name && s == result.session_name)
+            .unwrap_or(false);
+        if !matches_active {
+            return;
+        }
+        if !result.resolved {
+            return; // connection blip — keep whatever we were showing
+        }
+        self.log_for = Some((result.host_name, result.session_name));
+        self.log_content = result.content;
+        self.log_path = result.path;
+        self.log_mtime = result.mtime;
+    }
+
+    /// The progress pane is shown only when we have non-empty content for the
+    /// active session and the user hasn't hidden it.
+    pub fn has_log(&self) -> bool {
+        self.log_enabled
+            && !self.log_hidden
+            && self
+                .log_content
+                .as_ref()
+                .map(|c| !c.trim().is_empty())
+                .unwrap_or(false)
     }
 
     fn apply_snapshot_result(&mut self, result: SnapshotResult) {
@@ -278,6 +392,7 @@ impl App {
                 .map(|s| SessionInfo {
                     name: s.name.clone(),
                     hint: session_hint(s),
+                    cwd: active_cwd(s),
                 })
                 .collect();
             if let Some(db) = self.db.as_mut() {
@@ -310,6 +425,7 @@ impl App {
                 entry.sessions.push(SessionInfo {
                     name: result.session_name.clone(),
                     hint: None,
+                    cwd: None,
                 });
             }
             entry.closed.retain(|c| c.name != result.session_name);
@@ -396,6 +512,15 @@ impl App {
                 .unwrap_or((80, 24));
             self.panes
                 .insert(key.clone(), TerminalPane::new(cmd, cols.max(2), rows.max(2), env));
+        }
+        // New session on screen: drop the old log so the pane doesn't flash
+        // stale content, and force an immediate refetch.
+        if self.log_for.as_ref() != Some(&(host.name.clone(), session_name.to_string())) {
+            self.log_content = None;
+            self.log_path = None;
+            self.log_mtime = None;
+            self.log_for = None;
+            self.last_log_fetch = Instant::now() - Duration::from_secs(60);
         }
         self.active_key = Some(key.clone());
         self.focus = Focus::Terminal;
@@ -502,7 +627,11 @@ impl App {
                 // Show it in the sidebar immediately; the next poll confirms it.
                 let entry = &mut self.hosts[host_idx];
                 if !entry.sessions.iter().any(|s| s.name == name) {
-                    entry.sessions.push(SessionInfo { name, hint: None });
+                    entry.sessions.push(SessionInfo {
+                        name,
+                        hint: None,
+                        cwd: None,
+                    });
                 }
             }
             AppModal::Restore {
@@ -755,6 +884,15 @@ impl App {
                     if mods.ctrl && mods.shift && *key == egui::Key::E {
                         self.focus = Focus::Tree;
                         self.show_sidebar = true;
+                        continue;
+                    }
+                    if mods.ctrl && mods.shift && *key == egui::Key::L {
+                        self.log_hidden = !self.log_hidden;
+                        self.status = if self.log_hidden {
+                            "progress log hidden".into()
+                        } else {
+                            "progress log shown".into()
+                        };
                         continue;
                     }
                     // Font size: Ctrl+= / Ctrl++ bigger, Ctrl+- smaller,
@@ -1708,11 +1846,264 @@ impl App {
                 ui.add_space(6.0);
                 ui.colored_label(
                     Color32::from_gray(120),
-                    "drag:select  C-S-c:copy  C-S-v:paste  C-]/\\:cycle  C-S-e:tree  C-+/-:font  F2:sidebar  F5:refresh  C-S-q:quit",
+                    "drag:select  C-S-c:copy  C-S-v:paste  C-]/\\:cycle  C-S-e:tree  C-+/-:font  C-S-l:log  F2:sidebar  F5:refresh  C-S-q:quit",
                 );
             });
         });
     }
+
+    /// The narrative progress pane. Only called when `has_log()` is true.
+    pub fn render_progress(&self, ui: &mut Ui) {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.colored_label(
+                Color32::from_rgb(210, 180, 120),
+                egui::RichText::new("progress").strong(),
+            );
+            if let Some(path) = &self.log_path {
+                let name = path.rsplit('/').next().unwrap_or(path);
+                ui.colored_label(Color32::from_gray(110), name);
+            }
+        });
+        ui.separator();
+        let content = self.log_content.clone().unwrap_or_default();
+        // Default scroll position is the top — where the "Right now" block and
+        // newest entry live, so a returning reader is oriented without scrolling.
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.add_space(4.0);
+                render_markdown(ui, &content);
+                ui.add_space(8.0);
+            });
+    }
+
+    /// Test accessor: the log content currently held for the active session.
+    pub fn log_content_for_test(&self) -> Option<String> {
+        self.log_content.clone()
+    }
+}
+
+/// Minimal markdown renderer — enough for a narrative journal: ATX headings,
+/// bullet/numbered lists, `---` rules, fenced code, blockquote callouts,
+/// paragraphs (consecutive text lines soft-wrap into one), and inline
+/// **bold** / *italic* / `code`.
+fn render_markdown(ui: &mut Ui, text: &str) {
+    let mut para: Vec<&str> = Vec::new();
+    let mut quote: Vec<&str> = Vec::new();
+    let mut code: Vec<&str> = Vec::new();
+    let mut in_fence = false;
+
+    // Buffers must flush (in order) before any block-level element or a change
+    // of kind, so paragraphs and callouts group their lines correctly.
+    for raw in text.lines() {
+        let line = raw.trim_end();
+        let trimmed = line.trim_start();
+
+        if trimmed.starts_with("```") {
+            flush_para(ui, &mut para);
+            flush_quote(ui, &mut quote);
+            if in_fence {
+                flush_code(ui, &mut code);
+                in_fence = false;
+            } else {
+                in_fence = true;
+            }
+            continue;
+        }
+        if in_fence {
+            code.push(raw);
+            continue;
+        }
+
+        if trimmed.is_empty() {
+            flush_para(ui, &mut para);
+            flush_quote(ui, &mut quote);
+            ui.add_space(6.0);
+        } else if let Some(q) = trimmed.strip_prefix("> ").or_else(|| trimmed.strip_prefix(">")) {
+            flush_para(ui, &mut para);
+            quote.push(q);
+        } else if let Some(h) = trimmed.strip_prefix("### ") {
+            flush_para(ui, &mut para);
+            flush_quote(ui, &mut quote);
+            heading(ui, h, 15.0, Color32::from_rgb(150, 200, 235));
+        } else if let Some(h) = trimmed.strip_prefix("## ") {
+            flush_para(ui, &mut para);
+            flush_quote(ui, &mut quote);
+            ui.add_space(4.0);
+            heading(ui, h, 17.0, Color32::from_rgb(210, 180, 120));
+        } else if let Some(h) = trimmed.strip_prefix("# ") {
+            flush_para(ui, &mut para);
+            flush_quote(ui, &mut quote);
+            ui.add_space(4.0);
+            heading(ui, h, 20.0, Color32::from_rgb(230, 200, 140));
+        } else if trimmed == "---" || trimmed == "***" || trimmed == "___" {
+            flush_para(ui, &mut para);
+            flush_quote(ui, &mut quote);
+            ui.separator();
+        } else if let Some(item) = strip_bullet(trimmed) {
+            flush_para(ui, &mut para);
+            flush_quote(ui, &mut quote);
+            ui.horizontal_wrapped(|ui| {
+                ui.add_space(10.0);
+                ui.colored_label(Color32::from_gray(150), "•");
+                ui.add_space(4.0);
+                inline(ui, item, Color32::from_gray(205));
+            });
+        } else {
+            flush_quote(ui, &mut quote);
+            para.push(trimmed);
+        }
+    }
+    flush_para(ui, &mut para);
+    flush_quote(ui, &mut quote);
+    if in_fence {
+        flush_code(ui, &mut code);
+    }
+}
+
+fn flush_para(ui: &mut Ui, para: &mut Vec<&str>) {
+    if para.is_empty() {
+        return;
+    }
+    let text = para.join(" ");
+    para.clear();
+    ui.horizontal_wrapped(|ui| {
+        ui.add_space(4.0);
+        inline(ui, &text, Color32::from_gray(205));
+    });
+}
+
+/// The `> …` block is the hero element (the "Now / Health / Watch out"
+/// callout), so render it as a highlighted panel with an amber left edge —
+/// each source line on its own row, bright text.
+fn flush_quote(ui: &mut Ui, quote: &mut Vec<&str>) {
+    if quote.is_empty() {
+        return;
+    }
+    let lines: Vec<String> = quote.iter().map(|s| s.to_string()).collect();
+    quote.clear();
+    ui.add_space(2.0);
+    egui::Frame::new()
+        .fill(Color32::from_rgb(34, 31, 22))
+        .inner_margin(egui::Margin {
+            left: 10,
+            right: 8,
+            top: 6,
+            bottom: 6,
+        })
+        .corner_radius(4.0)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            for (i, line) in lines.iter().enumerate() {
+                if i > 0 {
+                    ui.add_space(3.0);
+                }
+                ui.horizontal_wrapped(|ui| {
+                    inline(ui, line, Color32::from_rgb(225, 225, 220));
+                });
+            }
+        });
+    ui.add_space(2.0);
+}
+
+fn flush_code(ui: &mut Ui, code: &mut Vec<&str>) {
+    if code.is_empty() {
+        return;
+    }
+    let text = code.join("\n");
+    code.clear();
+    egui::Frame::new()
+        .fill(Color32::from_gray(24))
+        .inner_margin(6.0)
+        .corner_radius(4.0)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(
+                egui::RichText::new(text)
+                    .monospace()
+                    .size(12.0)
+                    .color(Color32::from_gray(200)),
+            );
+        });
+}
+
+fn heading(ui: &mut Ui, text: &str, size: f32, color: Color32) {
+    ui.horizontal_wrapped(|ui| {
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new(text).size(size).strong().color(color));
+    });
+}
+
+fn strip_bullet(s: &str) -> Option<&str> {
+    for p in ["- ", "* ", "+ "] {
+        if let Some(rest) = s.strip_prefix(p) {
+            return Some(rest);
+        }
+    }
+    // "1. " / "12) " style ordered lists.
+    let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if !digits.is_empty() {
+        let after = &s[digits.len()..];
+        if let Some(rest) = after.strip_prefix(". ").or_else(|| after.strip_prefix(") ")) {
+            return Some(rest);
+        }
+    }
+    None
+}
+
+/// Render a line with inline **bold**, *italic* and `code` spans, wrapping.
+fn inline(ui: &mut Ui, text: &str, base: Color32) {
+    ui.spacing_mut().item_spacing.x = 0.0;
+    let mut chars = text.char_indices().peekable();
+    let mut plain = String::new();
+    let flush = |ui: &mut Ui, plain: &mut String| {
+        if !plain.is_empty() {
+            ui.label(egui::RichText::new(std::mem::take(plain)).color(base));
+        }
+    };
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '`' => {
+                if let Some(end) = text[i + 1..].find('`') {
+                    flush(ui, &mut plain);
+                    let code = &text[i + 1..i + 1 + end];
+                    ui.label(
+                        egui::RichText::new(code)
+                            .monospace()
+                            .size(12.5)
+                            .background_color(Color32::from_gray(30))
+                            .color(Color32::from_rgb(220, 200, 150)),
+                    );
+                    for _ in 0..end + 1 {
+                        chars.next();
+                    }
+                } else {
+                    plain.push(c);
+                }
+            }
+            '*' => {
+                let bold = chars.peek().map(|&(_, n)| n == '*').unwrap_or(false);
+                let marker = if bold { "**" } else { "*" };
+                let start = i + marker.len();
+                if let Some(rel) = text[start..].find(marker) {
+                    flush(ui, &mut plain);
+                    let span = &text[start..start + rel];
+                    let rt = egui::RichText::new(span).color(base);
+                    ui.label(if bold { rt.strong() } else { rt.italics() });
+                    // advance past span + closing marker (+ the extra '*' if bold)
+                    for _ in 0..(rel + marker.len() + (marker.len() - 1)) {
+                        chars.next();
+                    }
+                } else {
+                    plain.push(c);
+                }
+            }
+            _ => plain.push(c),
+        }
+    }
+    flush(ui, &mut plain);
 }
 
 fn cell_bg(
@@ -1791,6 +2182,17 @@ fn encode_mouse(button: u8, col: usize, row: usize, pressed: bool, sgr: bool) ->
             32 + (row as u8).saturating_add(1).min(223),
         ]
     }
+}
+
+/// Working directory to resolve the progress log against: the focused pane's
+/// cwd, falling back to the first pane.
+fn active_cwd(s: &SessionSnap) -> Option<String> {
+    s.panes
+        .iter()
+        .find(|p: &&PaneSnap| p.active)
+        .or_else(|| s.panes.first())
+        .map(|p| p.cwd.clone())
+        .filter(|c| !c.is_empty())
 }
 
 /// Sidebar hint for a live session: the short name of the first pane that's

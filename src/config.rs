@@ -29,6 +29,28 @@ pub struct CacheConfig {
     pub path: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct LogConfig {
+    /// Narrative-log filename looked for at the git root of the active
+    /// session's working directory. Default "PROGRESS.md".
+    #[serde(default)]
+    pub filename: Option<String>,
+    /// Set false to disable the progress pane entirely.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
+
+impl LogConfig {
+    pub fn filename(&self) -> String {
+        self.filename
+            .clone()
+            .unwrap_or_else(|| "PROGRESS.md".to_string())
+    }
+    pub fn enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -37,6 +59,8 @@ pub struct Config {
     pub env: Option<HashMap<String, String>>,
     #[serde(default)]
     pub cache: Option<CacheConfig>,
+    #[serde(default)]
+    pub log: Option<LogConfig>,
 }
 
 pub fn find_config_path(explicit: Option<PathBuf>) -> Option<PathBuf> {

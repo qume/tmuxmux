@@ -34,6 +34,13 @@ architecture (developed and tested on Linux, including Asahi/aarch64).
 - **Live hints** — the sidebar shows what's running in each session
   ("claude", "vim", …) and refreshes itself from the same snapshots; F5
   forces a poll.
+- **Progress pane** — a third pane, right of the terminal, that live-renders
+  a `PROGRESS.md` at the git root of the active session's working directory
+  (fetched over ssh for remote sessions). It appears only when that file
+  exists, so it costs no space otherwise. The bundled `progress-log` skill
+  teaches an LLM to keep that file as a low-energy re-entry briefing — a
+  rewritten "Now" callout plus newest-first dated entries — rather than a
+  manual. `Ctrl+Shift+L` hides/shows it.
 
 <p align="center">
   <img src="docs/closed.png" width="320" alt="closed sessions in the sidebar">
@@ -115,6 +122,7 @@ prints everything the cache knows and exits.
 | `Ctrl+]` / `Ctrl+\` | next / previous session |
 | `Ctrl+Shift+E` | focus the session tree |
 | `Ctrl+=` / `Ctrl+-` | bigger / smaller font (`Ctrl+0` resets) |
+| `Ctrl+Shift+L` | hide / show the progress pane |
 | `F2` | toggle sidebar |
 | `F5` | refresh session lists |
 | `Ctrl+Shift+Q` | quit |

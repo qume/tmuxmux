@@ -37,3 +37,9 @@ command = "sshpass -p secret ssh -tt -o ProxyCommand='cloudflared access ssh --h
 # interval_secs = 60
 # retention_days = 30
 # path = "~/.local/share/tmuxmux/sessions.db"   # default location
+
+# Progress pane (all optional). A right-hand pane live-renders this file from
+# the git root of the active session's working dir, when it exists.
+# [log]
+# filename = "PROGRESS.md"   # what to look for
+# enabled = true             # set false to disable the pane entirely

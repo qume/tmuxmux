@@ -4,6 +4,7 @@ mod colors;
 mod config;
 mod db;
 mod input;
+mod progresslog;
 mod restore;
 mod snapshot;
 mod ssh;
@@ -47,6 +48,8 @@ enum Step {
     NewModal(String),
     ModalAccept,
     Font(f32),
+    DumpLog,
+    HasLog,
     SnapshotNow,
     Restore(String, String),
     RestoreModal(String, String),
@@ -92,6 +95,8 @@ fn parse_script(s: &str) -> Vec<Step> {
             "newmodal" => Some(Step::NewModal(arg.trim().to_string())),
             "modal-accept" => Some(Step::ModalAccept),
             "font" => arg.trim().parse().ok().map(Step::Font),
+            "dump-log" => Some(Step::DumpLog),
+            "has-log" => Some(Step::HasLog),
             "snapshot-now" => Some(Step::SnapshotNow),
             "restore" => arg
                 .trim()
@@ -186,6 +191,19 @@ impl eframe::App for MainApp {
                 });
         }
 
+        // Right-hand progress pane — only present when the active session has
+        // a non-empty log, so it costs no screen room otherwise.
+        if self.inner.has_log() {
+            egui::SidePanel::right("progress")
+                .resizable(true)
+                .default_width(380.0)
+                .width_range(220.0..=640.0)
+                .frame(egui::Frame::new().fill(egui::Color32::from_rgb(20, 21, 25)))
+                .show(ctx, |ui| {
+                    self.inner.render_progress(ui);
+                });
+        }
+
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(colors::DEFAULT_BG))
             .show(ctx, |ui| {
@@ -194,9 +212,10 @@ impl eframe::App for MainApp {
 
         self.inner.render_modal(ctx);
 
-        // Steady repaint while a terminal is attached or a script is driving.
+        // Steady repaint while a terminal is attached, a log pane is polling,
+        // or a script is driving.
         let scripting = self.script_idx < self.script.len() || self.pending_shot;
-        if self.inner.focus == app::Focus::Terminal || scripting {
+        if self.inner.focus == app::Focus::Terminal || self.inner.has_log() || scripting {
             ctx.request_repaint_after(Duration::from_millis(16));
         } else {
             ctx.request_repaint_after(Duration::from_millis(200));
@@ -238,6 +257,13 @@ impl MainApp {
                 Step::NewModal(h) => self.inner.open_new_session_modal_by_host(&h),
                 Step::ModalAccept => self.inner.accept_modal(),
                 Step::Font(n) => self.inner.set_font_for_test(n),
+                Step::DumpLog => {
+                    println!(
+                        "LOG>>>{}<<<",
+                        self.inner.log_content_for_test().unwrap_or_default()
+                    );
+                }
+                Step::HasLog => println!("HASLOG:{}", self.inner.has_log()),
                 Step::SnapshotNow => self.inner.poll_now(),
                 Step::Restore(h, s) => match self.inner.host_index(&h) {
                     Some(hi) => self.inner.restore_sessions(hi, vec![s], true),
@@ -349,6 +375,7 @@ fn main() {
     let mut db_path: Option<PathBuf> = None;
     let mut cache_interval: Option<u64> = None;
     let mut snap_host: Option<String> = None;
+    let mut fetch_log_arg: Option<String> = None;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -363,6 +390,10 @@ fn main() {
             "--snap" => {
                 // Debug: take one snapshot of a host and print it.
                 snap_host = it.next().cloned();
+            }
+            "--fetch-log" => {
+                // Debug: fetch the progress log for HOST:CWD and print it.
+                fetch_log_arg = it.next().cloned();
             }
             "--db" => db_path = it.next().map(PathBuf::from),
             "--cache-interval" => cache_interval = it.next().and_then(|s| s.parse().ok()),
@@ -422,6 +453,29 @@ fn main() {
             }
             None => eprintln!("unknown host {name}"),
         }
+        return;
+    }
+
+    if let Some(spec) = fetch_log_arg {
+        // spec = HOST:CWD
+        let (hname, cwd) = spec.split_once(':').unwrap_or(("localhost", spec.as_str()));
+        let host = cfg
+            .hosts
+            .iter()
+            .find(|h| h.name == hname)
+            .cloned()
+            .unwrap_or(config::Host {
+                name: "localhost".into(),
+                username: None,
+                command: None,
+                local: true,
+                env: None,
+            });
+        let filename = cfg.log.as_ref().map(|l| l.filename()).unwrap_or_else(|| "PROGRESS.md".into());
+        let r = progresslog::fetch_log(host, "debug".into(), cwd.to_string(), filename);
+        println!("resolved={} path={:?} mtime={:?}", r.resolved, r.path, r.mtime);
+        println!("--- content ---");
+        print!("{}", r.content.unwrap_or_default());
         return;
     }
 
