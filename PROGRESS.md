@@ -1,10 +1,20 @@
 # tmuxmux — progress
 
-> **Now:** Third pane added — a live narrative log (this file), shown right of the terminal only when a repo has a `PROGRESS.md`. Fetches over ssh for remote sessions. Next move: dogfood it for a week, then decide if `Now`/entry caps feel right.
-> **Health:** working — builds, three-pane layout and remote fetch verified on `bots`.
-> **Watch out:** the progress pane polls the active session's log every 4s over its ssh connection; if that ever feels laggy, that's the knob.
+> **Now:** Progress pane shipped and working; sessions with a log now show an amber dot in the sidebar. Next move: dogfood for a week, then decide if the `Now`/entry word-caps feel right and whether to build a generator for non-agent sessions.
+> **Health:** working — three-pane layout, remote log fetch, and per-session badges all verified on `bots`.
+> **Watch out:** the log's *writer* side is unsolved — only Claude Code sessions that have the skill write logs. Populating them across all tools/hosts is still an open decision (generator vs teach-each-agent).
 
 ## Log
+
+### 2026-07-03 · Sidebar log badges
+Sessions whose repo has a `PROGRESS.md` now show a small amber dot, so you can
+tell at a glance which of many have context waiting. Detection is folded into
+the existing per-host snapshot — one ssh probe per host, not per session.
+Gotcha caught: first tried a tab field-separator, but tabs get flattened to
+`_` over ssh to non-UTF-8 hosts (same reason the sweep uses `<#~#>`); switched
+to the printable separator with POSIX parameter-expansion splitting.
+
+**Next:** decide the writer architecture (generator that distills scrollback, vs distributing the skill to every host) — the reader side is done.
 
 ### 2026-07-03 · Narrative progress pane
 Added a right-hand pane that renders a repo's `PROGRESS.md` and a `progress-log`

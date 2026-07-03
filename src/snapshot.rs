@@ -18,6 +18,7 @@ use crate::ssh::build_shell_command;
 /// name, path or layout is about as likely as a cosmic ray.
 const SEP: &str = "<#~#>";
 const PS_MARKER: &str = "__TMUXMUX_PS__";
+const LOG_MARKER: &str = "__TMUXMUX_LOGS__";
 
 #[derive(Debug, Clone)]
 pub struct PaneSnap {
@@ -39,6 +40,9 @@ pub struct SessionSnap {
     pub name: String,
     pub created_at: Option<i64>,
     pub panes: Vec<PaneSnap>,
+    /// Whether a progress-log file exists at the git root of the focused
+    /// pane's cwd — computed in the same host sweep so the sidebar can badge it.
+    pub has_log: bool,
 }
 
 #[derive(Debug)]
@@ -50,16 +54,47 @@ pub struct SnapshotResult {
 
 /// The remote shell command. tmux errors are folded into stdout so a host
 /// without a tmux server parses as "no sessions" rather than a failure.
-fn snapshot_command() -> String {
-    format!(
+///
+/// When `log_filename` is Some, a final section lists the sessions whose
+/// focused pane's git root contains that file — a per-session existence probe
+/// folded into the same single round-trip, so the sidebar can badge them
+/// without an extra connection per session.
+fn snapshot_command(log_filename: Option<&str>) -> String {
+    let base = format!(
         "tmux list-panes -a -F '#{{session_name}}{s}#{{session_created}}{s}#{{window_index}}{s}#{{window_name}}{s}#{{window_layout}}{s}#{{pane_index}}{s}#{{pane_pid}}{s}#{{pane_current_command}}{s}#{{pane_current_path}}{s}#{{pane_active}}' 2>&1; echo {m}; ps -eo ppid=,pid=,args= 2>/dev/null",
         s = SEP,
         m = PS_MARKER
-    )
+    );
+    match log_filename {
+        Some(f) if !f.is_empty() => {
+            // Second pass: for each focused pane, resolve the git root (or the
+            // cwd itself) and print the session name if the log file is there.
+            // Fields use the same printable-ASCII separator as the main sweep
+            // (a tab would be flattened to '_' over ssh to non-UTF-8 hosts),
+            // split with POSIX parameter expansion. Built by token-replace to
+            // avoid format!'s brace-escaping against the shell's ${...}.
+            let section = LOG_SECTION
+                .replace("@MARK@", LOG_MARKER)
+                .replace("@SEP@", SEP)
+                .replace("@FILE@", &crate::restore::sh_quote(f));
+            format!("{base}; {section}")
+        }
+        _ => base,
+    }
 }
 
-pub fn take_snapshot(host: Host) -> SnapshotResult {
-    let argv = build_shell_command(&host, &snapshot_command());
+const LOG_SECTION: &str = "echo @MARK@; \
+    tmux list-panes -a -F '#{pane_active}@SEP@#{session_name}@SEP@#{pane_current_path}' 2>/dev/null | \
+    while IFS= read -r line; do \
+      a=${line%%@SEP@*}; rest=${line#*@SEP@}; s=${rest%%@SEP@*}; p=${rest#*@SEP@}; \
+      [ \"$a\" = 1 ] || continue; \
+      r=$(git -C \"$p\" rev-parse --show-toplevel 2>/dev/null); \
+      [ -z \"$r\" ] && r=\"$p\"; \
+      [ -f \"$r/\"@FILE@ ] && printf '%s\\n' \"$s\"; \
+    done";
+
+pub fn take_snapshot(host: Host, log_filename: Option<&str>) -> SnapshotResult {
+    let argv = build_shell_command(&host, &snapshot_command(log_filename));
     let mut cmd = std::process::Command::new(&argv[0]);
     cmd.args(&argv[1..]);
     let output = match cmd.output() {
@@ -90,7 +125,11 @@ pub fn take_snapshot(host: Host) -> SnapshotResult {
         };
     }
 
-    let (pane_part, ps_part) = stdout.split_once(PS_MARKER).unwrap();
+    let (pane_part, rest) = stdout.split_once(PS_MARKER).unwrap();
+    // The log section (if requested) follows its own marker after the ps dump.
+    let (ps_part, log_part) = rest.split_once(LOG_MARKER).unwrap_or((rest, ""));
+    let logged: std::collections::HashSet<&str> =
+        log_part.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
 
     // tmux not running (or zero sessions) is a normal empty result.
     let benign = ["no server running", "no sessions", "error connecting to"];
@@ -103,7 +142,7 @@ pub fn take_snapshot(host: Host) -> SnapshotResult {
         }
     }
 
-    let sessions = parse_snapshot(pane_part, ps_part);
+    let sessions = parse_snapshot(pane_part, ps_part, &logged);
     SnapshotResult {
         host_name: host.name,
         sessions,
@@ -111,7 +150,11 @@ pub fn take_snapshot(host: Host) -> SnapshotResult {
     }
 }
 
-fn parse_snapshot(pane_part: &str, ps_part: &str) -> Vec<SessionSnap> {
+fn parse_snapshot(
+    pane_part: &str,
+    ps_part: &str,
+    logged: &std::collections::HashSet<&str>,
+) -> Vec<SessionSnap> {
     // Process table: pid → args, ppid → [(pid, args)]
     let mut procs: HashMap<i64, String> = HashMap::new();
     let mut children: HashMap<i64, Vec<(i64, String)>> = HashMap::new();
@@ -146,11 +189,15 @@ fn parse_snapshot(pane_part: &str, ps_part: &str) -> Vec<SessionSnap> {
         };
         match sessions.iter_mut().find(|s| s.name == name) {
             Some(s) => s.panes.push(pane),
-            None => sessions.push(SessionSnap {
-                name,
-                created_at,
-                panes: vec![pane],
-            }),
+            None => {
+                let has_log = logged.contains(name.as_str());
+                sessions.push(SessionSnap {
+                    name,
+                    created_at,
+                    panes: vec![pane],
+                    has_log,
+                })
+            }
         }
     }
     sessions
@@ -213,11 +260,18 @@ fn pane_cmdline(
 }
 
 /// Poll the given hosts concurrently, one thread each, reporting on `tx`.
-pub fn spawn_snapshots(hosts: Vec<Host>, tx: mpsc::Sender<SnapshotResult>) {
+/// `log_filename` (when set) enables the per-session progress-log existence
+/// probe folded into each host's single round-trip.
+pub fn spawn_snapshots(
+    hosts: Vec<Host>,
+    tx: mpsc::Sender<SnapshotResult>,
+    log_filename: Option<String>,
+) {
     for host in hosts {
         let tx = tx.clone();
+        let f = log_filename.clone();
         thread::spawn(move || {
-            let _ = tx.send(take_snapshot(host));
+            let _ = tx.send(take_snapshot(host, f.as_deref()));
         });
     }
 }

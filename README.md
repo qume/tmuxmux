@@ -40,7 +40,10 @@ architecture (developed and tested on Linux, including Asahi/aarch64).
   exists, so it costs no space otherwise. The bundled `progress-log` skill
   teaches an LLM to keep that file as a low-energy re-entry briefing — a
   rewritten "Now" callout plus newest-first dated entries — rather than a
-  manual. `Ctrl+Shift+L` hides/shows it.
+  manual. `Ctrl+Shift+L` hides/shows it. Sessions that have a log get a small
+  amber dot in the sidebar (detected in the same per-host snapshot sweep, so
+  it's one probe per host, not per session), so you can see at a glance which
+  of many sessions have context waiting.
 
 <p align="center">
   <img src="docs/closed.png" width="320" alt="closed sessions in the sidebar">

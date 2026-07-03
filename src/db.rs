@@ -212,6 +212,7 @@ impl Db {
             name: name.to_string(),
             created_at: None,
             panes,
+            has_log: false,
         })
     }
 

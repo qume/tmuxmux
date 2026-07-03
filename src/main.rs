@@ -433,10 +433,15 @@ fn main() {
     if let Some(name) = snap_host {
         match cfg.hosts.iter().find(|h| h.name == name) {
             Some(host) => {
-                let r = snapshot::take_snapshot(host.clone());
+                let lc = cfg.log.clone().unwrap_or_default();
+                let logf = if lc.enabled() { Some(lc.filename()) } else { None };
+                let r = snapshot::take_snapshot(host.clone(), logf.as_deref());
                 println!("error: {:?}", r.error);
                 for s in r.sessions {
-                    println!("session {} created={:?}", s.name, s.created_at);
+                    println!(
+                        "session {} created={:?} has_log={}",
+                        s.name, s.created_at, s.has_log
+                    );
                     for p in s.panes {
                         println!(
                             "  {}:{} ({}) cwd={} cmd={} cmdline={:?} layout={}",

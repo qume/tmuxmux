@@ -30,6 +30,8 @@ pub struct SessionInfo {
     pub hint: Option<String>,
     /// Working directory of the focused pane — where we look for the log.
     pub cwd: Option<String>,
+    /// Whether a progress log exists for this session (from the host sweep).
+    pub has_log: bool,
 }
 
 pub struct HostEntry {
@@ -269,7 +271,12 @@ impl App {
             self.in_flight.insert(h.name.clone());
         }
         self.last_poll = Instant::now();
-        spawn_snapshots(due, self.snapshot_tx.clone());
+        let logf = if self.log_enabled {
+            Some(self.log_filename.clone())
+        } else {
+            None
+        };
+        spawn_snapshots(due, self.snapshot_tx.clone(), logf);
     }
 
     /// Called every frame: kick scheduled polls, absorb results.
@@ -393,6 +400,7 @@ impl App {
                     name: s.name.clone(),
                     hint: session_hint(s),
                     cwd: active_cwd(s),
+                    has_log: s.has_log,
                 })
                 .collect();
             if let Some(db) = self.db.as_mut() {
@@ -426,6 +434,7 @@ impl App {
                     name: result.session_name.clone(),
                     hint: None,
                     cwd: None,
+                    has_log: false,
                 });
             }
             entry.closed.retain(|c| c.name != result.session_name);
@@ -631,6 +640,7 @@ impl App {
                         name,
                         hint: None,
                         cwd: None,
+                        has_log: false,
                     });
                 }
             }
@@ -1205,6 +1215,10 @@ impl App {
                 } else if response.hovered() {
                     ui.painter().rect_filled(rect, 3.0, Color32::from_gray(45));
                 }
+                // A session with a progress log gets a small amber dot after
+                // its name, so you can see which of many have context waiting.
+                let badge = matches!(row, Row::Session(hi, si) if self.hosts[*hi].sessions[*si].has_log);
+
                 let text_rect = ui.painter().text(
                     rect.left_center() + Vec2::new(indent, 0.0),
                     egui::Align2::LEFT_CENTER,
@@ -1212,9 +1226,21 @@ impl App {
                     FontId::monospace(13.0),
                     color,
                 );
+                let mut next_x = text_rect.right();
+                if badge {
+                    let dot = egui::pos2(next_x + 8.0, rect.center().y);
+                    ui.painter().text(
+                        dot,
+                        egui::Align2::LEFT_CENTER,
+                        "●",
+                        FontId::monospace(9.0),
+                        Color32::from_rgb(210, 180, 120),
+                    );
+                    next_x += 16.0;
+                }
                 if let Some(hint) = hint {
                     ui.painter().text(
-                        egui::pos2(text_rect.right() + 10.0, rect.center().y),
+                        egui::pos2(next_x + 10.0, rect.center().y),
                         egui::Align2::LEFT_CENTER,
                         truncate(&hint, 14),
                         FontId::monospace(11.0),
