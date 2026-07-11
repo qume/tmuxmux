@@ -43,3 +43,14 @@ command = "sshpass -p secret ssh -tt -o ProxyCommand='cloudflared access ssh --h
 # [log]
 # filename = "PROGRESS.md"   # what to look for
 # enabled = true             # set false to disable the pane entirely
+
+# App-manager instances (geocam apps-manager). Each entry logs in on launch
+# and pulls every app you can reach, grouped mine/shared/public, with a
+# ready-to-run ssh command per app. Discovered apps are written back below an
+# auto-generated marker at the end of this file: new ones added, existing kept,
+# vanished ones marked closed. Multiple instances are supported.
+# [[app_managers]]
+# domain = "apps-manager-app.geocam.io"
+# username = "you@example.com"
+# password = "..."
+# name = "geocam"            # optional friendly label (defaults to the domain)

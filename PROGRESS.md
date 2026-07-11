@@ -1,10 +1,22 @@
 # tmuxmux — progress
 
-> **Now:** Progress pane shipped and working; sessions with a log now show an amber dot in the sidebar. Next move: dogfood for a week, then decide if the `Now`/entry word-caps feel right and whether to build a generator for non-agent sessions.
-> **Health:** working — three-pane layout, remote log fetch, and per-session badges all verified on `bots`.
-> **Watch out:** the log's *writer* side is unsolved — only Claude Code sessions that have the skill write logs. Populating them across all tools/hosts is still an open decision (generator vs teach-each-agent).
+> **Now:** App-manager integration landed — tmuxmux pulls apps from a geocam apps-manager instance and shows them grouped instance → mine/shared/public → app → sessions. Verified end-to-end against the live API. Next move: wire it into the real ~/sync/hosts.toml with your own login and live with it.
+> **Health:** working — login + connect-list fetch, reconcile/mark-closed, write-back preserving hand-written hosts, and the grouped sidebar all verified against apps-manager-app.geocam.io.
+> **Watch out:** enabling an [[app_managers]] entry makes tmuxmux rewrite hosts.toml on launch (only below the auto marker — hand-written hosts above are safe). Every non-closed app is snapshotted on the poll cycle, so a manager with many apps means many cloudflared ssh connections per cycle.
 
 ## Log
+
+### 2026-07-11 · App-manager integration
+tmuxmux can now pull apps from geocam apps-manager instances. Config is
+`[[app_managers]]` (domain + user/pass); on launch it logs in
+(`/api/auth/login` → JWT), calls the new `/api/apps/connect-list`, and
+materialises each app as a host grouped instance → category → app. The
+apps-manager side already returned three buckets + a ready ssh command, so the
+other bot only had to add a thin stable endpoint. Discovered apps are written
+back below a marker in hosts.toml; reconcile keeps hand-written hosts and marks
+vanished apps closed.
+
+**Next:** add [[app_managers]] to ~/sync/hosts.toml with your real login; consider gating snapshots to expanded apps if the connection fan-out feels heavy.
 
 ### 2026-07-03 · Sidebar log badges
 Sessions whose repo has a `PROGRESS.md` now show a small amber dot, so you can

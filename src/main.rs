@@ -1,5 +1,6 @@
 mod acs;
 mod app;
+mod appmanager;
 mod colors;
 mod config;
 mod db;
@@ -371,6 +372,7 @@ fn main() {
     let mut config_path: Option<PathBuf> = None;
     let mut script = String::new();
     let mut list_and_exit = false;
+    let mut sync_apps = false;
     let mut dump_cache = false;
     let mut db_path: Option<PathBuf> = None;
     let mut cache_interval: Option<u64> = None;
@@ -386,6 +388,7 @@ fn main() {
                 }
             }
             "--list" => list_and_exit = true,
+            "--sync-apps" => sync_apps = true,
             "--dump-cache" => dump_cache = true,
             "--snap" => {
                 // Debug: take one snapshot of a host and print it.
@@ -475,12 +478,33 @@ fn main() {
                 command: None,
                 local: true,
                 env: None,
+                manager: None,
+                category: None,
+                status: None,
+                closed: false,
             });
         let filename = cfg.log.as_ref().map(|l| l.filename()).unwrap_or_else(|| "PROGRESS.md".into());
         let r = progresslog::fetch_log(host, "debug".into(), cwd.to_string(), filename);
         println!("resolved={} path={:?} mtime={:?}", r.resolved, r.path, r.mtime);
         println!("--- content ---");
         print!("{}", r.content.unwrap_or_default());
+        return;
+    }
+
+    if sync_apps {
+        if cfg.app_managers.is_empty() {
+            println!("no [[app_managers]] configured in {}", path.display());
+        } else {
+            let summary = appmanager::sync_blocking(&path, &cfg);
+            for l in &summary.lines {
+                println!("{l}");
+            }
+            println!(
+                "wrote {} auto-managed host(s) to {}",
+                summary.auto_hosts.len(),
+                path.display()
+            );
+        }
         return;
     }
 
@@ -537,7 +561,7 @@ fn main() {
         Box::new(move |cc| {
             cc.egui_ctx.style_mut(|s| s.visuals = egui::Visuals::dark());
             Ok(Box::new(MainApp {
-                inner: App::new(cfg, db_path, cache_interval),
+                inner: App::new(cfg, path.clone(), db_path, cache_interval),
                 script: steps,
                 script_idx: 0,
                 script_wait_until: Instant::now(),

@@ -13,6 +13,35 @@ pub struct Host {
     pub local: bool,
     #[serde(default)]
     pub env: Option<HashMap<String, String>>,
+
+    // --- fields for hosts auto-managed from an app-manager instance ---
+    /// Domain of the app-manager this host came from (None = hand-written).
+    #[serde(default)]
+    pub manager: Option<String>,
+    /// Visibility bucket on that instance: "mine" | "shared" | "public".
+    #[serde(default)]
+    pub category: Option<String>,
+    /// Last-known app lifecycle status (running, stopped, …).
+    #[serde(default)]
+    pub status: Option<String>,
+    /// True when the app is no longer returned by its manager (destroyed or
+    /// unshared) — kept in the file, shown dimmed, rather than deleted.
+    #[serde(default)]
+    pub closed: bool,
+}
+
+/// An app-manager instance to pull apps from (geocam apps-manager). Each one
+/// expands, on launch, into many auto-managed [[hosts]] grouped by category.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AppManager {
+    /// API base, e.g. "apps-manager-app.geocam.io" (https:// optional).
+    pub domain: String,
+    pub username: String,
+    pub password: String,
+    /// Optional friendly label; defaults to the instance name from the API,
+    /// falling back to the domain.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -61,6 +90,8 @@ pub struct Config {
     pub cache: Option<CacheConfig>,
     #[serde(default)]
     pub log: Option<LogConfig>,
+    #[serde(default)]
+    pub app_managers: Vec<AppManager>,
 }
 
 pub fn find_config_path(explicit: Option<PathBuf>) -> Option<PathBuf> {

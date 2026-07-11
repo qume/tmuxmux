@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use egui::{Color32, FontId, Pos2, Rect, Sense, Ui, Vec2};
 
+use crate::appmanager;
 use crate::colors::{convert_bg, convert_fg, DEFAULT_BG, DEFAULT_FG, SELECTION_BG};
 use crate::config::{Config, Host};
 use crate::db::{self, Db};
@@ -44,19 +45,25 @@ pub struct HostEntry {
     pub expanded: bool,
 }
 
-/// Flattened sidebar row, rebuilt every frame from `hosts`.
+/// Flattened sidebar row, rebuilt every frame from `hosts`. `usize` is an
+/// index into `self.hosts`; `grouped` marks rows nested under an app-manager
+/// instance (extra indent).
 #[derive(Clone)]
 enum Row {
-    Host(usize),
-    Session(usize, usize),
+    Host(usize, bool),
+    Session(usize, usize, bool),
     /// The "+ new" row at the end of a host's session list.
-    NewSession(usize),
+    NewSession(usize, bool),
     /// "⟲ closed (N)" toggle for the cached-session group.
-    ClosedToggle(usize),
+    ClosedToggle(usize, bool),
     /// One restorable cached session.
-    Closed(usize, usize),
+    Closed(usize, usize, bool),
     /// "⟲ restore all" bulk action.
-    RestoreAll(usize),
+    RestoreAll(usize, bool),
+    /// App-manager instance header (domain key).
+    ManagerHeader(String),
+    /// Category header within an instance (domain, category, count).
+    CategoryHeader(String, String, usize),
 }
 
 /// Whichever dialog is open.
@@ -133,6 +140,14 @@ pub struct App {
     poll_interval: Duration,
     last_poll: Instant,
 
+    // App-manager sync (apps discovered from geocam apps-manager instances).
+    config_path: PathBuf,
+    app_sync_tx: mpsc::Sender<Vec<Host>>,
+    app_sync_rx: mpsc::Receiver<Vec<Host>>,
+    app_sync_in_flight: bool,
+    /// Collapsed sidebar groups: "mgr:<domain>" and "cat:<domain>/<category>".
+    collapsed_groups: HashSet<String>,
+
     // Narrative progress log (right-hand pane).
     log_tx: mpsc::Sender<LogResult>,
     log_rx: mpsc::Receiver<LogResult>,
@@ -162,6 +177,7 @@ pub struct App {
 impl App {
     pub fn new(
         config: Config,
+        config_path: PathBuf,
         db_path_override: Option<PathBuf>,
         interval_override: Option<u64>,
     ) -> Self {
@@ -199,7 +215,9 @@ impl App {
                 closed_expanded: false,
                 loaded: false,
                 error: None,
-                expanded: true,
+                // Apps (from an app-manager) start collapsed to keep the
+                // grouped tree scannable; hand-written hosts start open.
+                expanded: h.manager.is_none(),
             })
             .collect();
 
@@ -214,6 +232,7 @@ impl App {
         let (snapshot_tx, snapshot_rx) = mpsc::channel();
         let (restore_tx, restore_rx) = mpsc::channel();
         let (log_tx, log_rx) = mpsc::channel();
+        let (app_sync_tx, app_sync_rx) = mpsc::channel();
 
         let log_cfg = config.log.clone().unwrap_or_default();
 
@@ -232,6 +251,11 @@ impl App {
             db,
             poll_interval: Duration::from_secs(interval_secs),
             last_poll: Instant::now(),
+            config_path,
+            app_sync_tx,
+            app_sync_rx,
+            app_sync_in_flight: false,
+            collapsed_groups: HashSet::new(),
             log_tx,
             log_rx,
             log_enabled: log_cfg.enabled(),
@@ -253,7 +277,83 @@ impl App {
             font_size: 14.0,
         };
         app.poll_now();
+        app.spawn_app_sync();
         app
+    }
+
+    // ---------- app-manager sync ----------
+
+    /// Refresh apps from every configured app-manager in the background:
+    /// fetch, reconcile against the current hosts, rewrite hosts.toml, and
+    /// hand the new auto-host list back on the channel.
+    pub fn spawn_app_sync(&mut self) {
+        if self.config.app_managers.is_empty() || self.app_sync_in_flight {
+            return;
+        }
+        self.app_sync_in_flight = true;
+        let managers = self.config.app_managers.clone();
+        let prev_hosts = self.config.hosts.clone();
+        let path = self.config_path.clone();
+        let tx = self.app_sync_tx.clone();
+        thread::spawn(move || {
+            let results: Vec<_> = managers.iter().map(appmanager::fetch).collect();
+            let auto = appmanager::reconcile(&prev_hosts, &results);
+            if let Err(e) = appmanager::write_back(&path, &auto) {
+                log::error!("app-manager write-back failed: {e}");
+            }
+            let _ = tx.send(auto);
+        });
+    }
+
+    /// Merge freshly-synced auto hosts into the live host list, preserving
+    /// hand-written hosts and the runtime state (sessions, expanded, …) of any
+    /// host that persists across the sync.
+    fn apply_app_sync(&mut self, auto: Vec<Host>) {
+        self.app_sync_in_flight = false;
+
+        // Desired host order: hand-written (config order) then auto hosts.
+        let hand: Vec<Host> = self
+            .config
+            .hosts
+            .iter()
+            .filter(|h| h.manager.is_none())
+            .cloned()
+            .collect();
+        let mut desired = hand;
+        desired.extend(auto);
+
+        // Reuse existing HostEntry state by name; refresh the Host payload.
+        let mut old: HashMap<String, HostEntry> = self
+            .hosts
+            .drain(..)
+            .map(|e| (e.host.name.clone(), e))
+            .collect();
+
+        let mut new_entries = Vec::with_capacity(desired.len());
+        for host in &desired {
+            if let Some(mut e) = old.remove(&host.name) {
+                e.host = host.clone();
+                new_entries.push(e);
+            } else {
+                new_entries.push(HostEntry {
+                    closed: self
+                        .db
+                        .as_ref()
+                        .map(|d| d.closed_sessions(&host.name))
+                        .unwrap_or_default(),
+                    expanded: host.manager.is_none(),
+                    host: host.clone(),
+                    sessions: Vec::new(),
+                    closed_expanded: false,
+                    loaded: false,
+                    error: None,
+                });
+            }
+        }
+        self.hosts = new_entries;
+        self.config.hosts = desired;
+        // Snapshot any newly-added hosts so their sessions populate.
+        self.poll_now();
     }
 
     // ---------- snapshot polling ----------
@@ -264,7 +364,8 @@ impl App {
             .config
             .hosts
             .iter()
-            .filter(|h| !self.in_flight.contains(&h.name))
+            // Closed apps are gone — don't waste a connection attempt on them.
+            .filter(|h| !h.closed && !self.in_flight.contains(&h.name))
             .cloned()
             .collect();
         for h in &due {
@@ -297,6 +398,10 @@ impl App {
             self.apply_log_result(result);
         }
         self.maybe_fetch_log();
+
+        while let Ok(auto) = self.app_sync_rx.try_recv() {
+            self.apply_app_sync(auto);
+        }
     }
 
     // ---------- progress log ----------
@@ -449,6 +554,7 @@ impl App {
     pub fn refresh_all(&mut self) {
         self.status = "refreshing...".into();
         self.poll_now();
+        self.spawn_app_sync();
     }
 
     pub fn host_index(&self, name: &str) -> Option<usize> {
@@ -1020,29 +1126,73 @@ impl App {
 
     fn visible_rows(&self) -> Vec<Row> {
         let mut rows = Vec::new();
+        // 1. Hand-written hosts (no manager) at the top, flat.
         for (hi, entry) in self.hosts.iter().enumerate() {
-            rows.push(Row::Host(hi));
-            if entry.expanded {
-                for si in 0..entry.sessions.len() {
-                    rows.push(Row::Session(hi, si));
+            if entry.host.manager.is_none() {
+                self.emit_host_rows(hi, entry, false, &mut rows);
+            }
+        }
+        // 2. App-manager instances → categories → apps.
+        let mut managers: Vec<String> = Vec::new();
+        for e in &self.hosts {
+            if let Some(m) = &e.host.manager {
+                if !managers.contains(m) {
+                    managers.push(m.clone());
                 }
-                if entry.loaded && entry.error.is_none() {
-                    rows.push(Row::NewSession(hi));
+            }
+        }
+        for m in &managers {
+            rows.push(Row::ManagerHeader(m.clone()));
+            if self.collapsed_groups.contains(&format!("mgr:{m}")) {
+                continue;
+            }
+            for cat in ["mine", "shared", "public"] {
+                let cat_hosts: Vec<usize> = self
+                    .hosts
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| {
+                        e.host.manager.as_deref() == Some(m.as_str())
+                            && e.host.category.as_deref() == Some(cat)
+                    })
+                    .map(|(hi, _)| hi)
+                    .collect();
+                if cat_hosts.is_empty() {
+                    continue;
                 }
-                if !entry.closed.is_empty() {
-                    rows.push(Row::ClosedToggle(hi));
-                    if entry.closed_expanded {
-                        for ci in 0..entry.closed.len() {
-                            rows.push(Row::Closed(hi, ci));
-                        }
-                        if entry.closed.len() > 1 {
-                            rows.push(Row::RestoreAll(hi));
-                        }
-                    }
+                rows.push(Row::CategoryHeader(m.clone(), cat.to_string(), cat_hosts.len()));
+                if self.collapsed_groups.contains(&format!("cat:{m}/{cat}")) {
+                    continue;
+                }
+                for hi in cat_hosts {
+                    self.emit_host_rows(hi, &self.hosts[hi], true, &mut rows);
                 }
             }
         }
         rows
+    }
+
+    fn emit_host_rows(&self, hi: usize, entry: &HostEntry, grouped: bool, rows: &mut Vec<Row>) {
+        rows.push(Row::Host(hi, grouped));
+        if entry.expanded {
+            for si in 0..entry.sessions.len() {
+                rows.push(Row::Session(hi, si, grouped));
+            }
+            if entry.loaded && entry.error.is_none() && !entry.host.closed {
+                rows.push(Row::NewSession(hi, grouped));
+            }
+            if !entry.closed.is_empty() {
+                rows.push(Row::ClosedToggle(hi, grouped));
+                if entry.closed_expanded {
+                    for ci in 0..entry.closed.len() {
+                        rows.push(Row::Closed(hi, ci, grouped));
+                    }
+                    if entry.closed.len() > 1 {
+                        rows.push(Row::RestoreAll(hi, grouped));
+                    }
+                }
+            }
+        }
     }
 
     fn handle_tree_key(&mut self, key: egui::Key) {
@@ -1058,44 +1208,68 @@ impl App {
             egui::Key::ArrowDown => {
                 self.tree_cursor = (self.tree_cursor + 1).min(rows.len() - 1);
             }
-            egui::Key::ArrowLeft => match rows[self.tree_cursor] {
-                Row::Host(hi) | Row::NewSession(hi) => {
+            egui::Key::ArrowLeft => match rows[self.tree_cursor].clone() {
+                Row::Host(hi, _) | Row::NewSession(hi, _) => {
                     self.hosts[hi].expanded = false;
                 }
-                Row::ClosedToggle(hi) | Row::Closed(hi, _) | Row::RestoreAll(hi) => {
+                Row::ClosedToggle(hi, _) | Row::Closed(hi, _, _) | Row::RestoreAll(hi, _) => {
                     self.hosts[hi].closed_expanded = false;
+                }
+                Row::ManagerHeader(m) => {
+                    self.collapsed_groups.insert(format!("mgr:{m}"));
+                }
+                Row::CategoryHeader(m, c, _) => {
+                    self.collapsed_groups.insert(format!("cat:{m}/{c}"));
                 }
                 Row::Session(..) => {}
             },
-            egui::Key::ArrowRight => match rows[self.tree_cursor] {
-                Row::Host(hi) => self.hosts[hi].expanded = true,
-                Row::ClosedToggle(hi) => self.hosts[hi].closed_expanded = true,
+            egui::Key::ArrowRight => match rows[self.tree_cursor].clone() {
+                Row::Host(hi, _) => self.hosts[hi].expanded = true,
+                Row::ClosedToggle(hi, _) => self.hosts[hi].closed_expanded = true,
+                Row::ManagerHeader(m) => {
+                    self.collapsed_groups.remove(&format!("mgr:{m}"));
+                }
+                Row::CategoryHeader(m, c, _) => {
+                    self.collapsed_groups.remove(&format!("cat:{m}/{c}"));
+                }
                 _ => {}
             },
-            egui::Key::Enter => match rows[self.tree_cursor] {
-                Row::Host(hi) => {
+            egui::Key::Enter => match rows[self.tree_cursor].clone() {
+                Row::Host(hi, _) => {
                     self.hosts[hi].expanded = !self.hosts[hi].expanded;
                 }
-                Row::Session(hi, si) => {
+                Row::Session(hi, si, _) => {
                     let h = self.hosts[hi].host.name.clone();
                     let s = self.hosts[hi].sessions[si].name.clone();
                     self.activate_session(&h, &s);
                 }
-                Row::NewSession(hi) => {
+                Row::NewSession(hi, _) => {
                     self.open_new_session_modal(hi);
                 }
-                Row::ClosedToggle(hi) => {
+                Row::ClosedToggle(hi, _) => {
                     self.hosts[hi].closed_expanded = !self.hosts[hi].closed_expanded;
                 }
-                Row::Closed(hi, ci) => {
+                Row::Closed(hi, ci, _) => {
                     let name = self.hosts[hi].closed[ci].name.clone();
                     self.open_restore_modal(hi, &name);
                 }
-                Row::RestoreAll(hi) => {
+                Row::RestoreAll(hi, _) => {
                     self.open_restore_all_modal(hi);
+                }
+                Row::ManagerHeader(m) => {
+                    self.toggle_group(&format!("mgr:{m}"));
+                }
+                Row::CategoryHeader(m, c, _) => {
+                    self.toggle_group(&format!("cat:{m}/{c}"));
                 }
             },
             _ => {}
+        }
+    }
+
+    fn toggle_group(&mut self, key: &str) {
+        if !self.collapsed_groups.remove(key) {
+            self.collapsed_groups.insert(key.to_string());
         }
     }
 
@@ -1112,6 +1286,7 @@ impl App {
         let rows = self.visible_rows();
         let mut pending: Option<(String, String)> = None;
         let mut toggle: Option<usize> = None;
+        let mut toggle_group: Option<String> = None;
         let mut toggle_closed: Option<usize> = None;
         let mut new_modal: Option<usize> = None;
         let mut restore_one: Option<(usize, String)> = None;
@@ -1120,31 +1295,75 @@ impl App {
         egui::ScrollArea::vertical().show(ui, |ui| {
             for (i, row) in rows.iter().enumerate() {
                 let is_cursor = self.focus == Focus::Tree && self.tree_cursor == i;
+                // Grouped rows (apps under an instance) are indented one level
+                // deeper than the equivalent hand-written-host rows.
+                let g = |base: f32, grouped: bool| base + if grouped { 18.0 } else { 0.0 };
                 let (label, hint, indent, color, is_active) = match row {
-                    Row::Host(hi) => {
+                    Row::ManagerHeader(m) => {
+                        let collapsed = self.collapsed_groups.contains(&format!("mgr:{m}"));
+                        let arrow = if collapsed { "▸" } else { "▾" };
+                        let label = self
+                            .config
+                            .app_managers
+                            .iter()
+                            .find(|am| &am.domain == m)
+                            .and_then(|am| am.name.clone())
+                            .unwrap_or_else(|| m.clone());
+                        (
+                            format!("{arrow} ☰ {label}"),
+                            None,
+                            6.0,
+                            Color32::from_rgb(180, 150, 235),
+                            false,
+                        )
+                    }
+                    Row::CategoryHeader(m, c, n) => {
+                        let collapsed =
+                            self.collapsed_groups.contains(&format!("cat:{m}/{c}"));
+                        let arrow = if collapsed { "▸" } else { "▾" };
+                        (
+                            format!("{arrow} {c} ({n})"),
+                            None,
+                            18.0,
+                            Color32::from_rgb(150, 160, 190),
+                            false,
+                        )
+                    }
+                    Row::Host(hi, grouped) => {
                         let e = &self.hosts[hi.to_owned()];
+                        let closed_app = e.host.closed;
                         let arrow = if e.expanded { "▾" } else { "▸" };
-                        let suffix = if !e.loaded {
+                        let suffix = if closed_app {
+                            " (closed)".to_string()
+                        } else if !e.loaded {
                             " …".to_string()
                         } else if let Some(err) = &e.error {
-                            format!(" ✗ {}", truncate(err, 28))
+                            format!(" ✗ {}", truncate(err, 24))
                         } else {
                             format!(" ({})", e.sessions.len())
                         };
-                        let color = if e.error.is_some() {
+                        let color = if closed_app {
+                            Color32::from_gray(110)
+                        } else if e.error.is_some() {
                             Color32::from_rgb(235, 90, 90)
                         } else {
                             Color32::from_rgb(90, 200, 250)
                         };
+                        // App status (running/stopped) shown as a hint.
+                        let hint = if *grouped && !closed_app {
+                            e.host.status.clone()
+                        } else {
+                            None
+                        };
                         (
                             format!("{arrow} {}{suffix}", e.host.name),
-                            None,
-                            6.0,
+                            hint,
+                            g(6.0, *grouped),
                             color,
                             false,
                         )
                     }
-                    Row::Session(hi, si) => {
+                    Row::Session(hi, si, grouped) => {
                         let e = &self.hosts[*hi];
                         let s = &e.sessions[*si];
                         let key = format!("{}/{}", e.host.name, s.name);
@@ -1154,27 +1373,27 @@ impl App {
                         } else {
                             Color32::from_gray(220)
                         };
-                        (s.name.clone(), s.hint.clone(), 24.0, color, active)
+                        (s.name.clone(), s.hint.clone(), g(24.0, *grouped), color, active)
                     }
-                    Row::NewSession(_) => (
+                    Row::NewSession(_, grouped) => (
                         "+ new".to_string(),
                         None,
-                        24.0,
+                        g(24.0, *grouped),
                         Color32::from_gray(130),
                         false,
                     ),
-                    Row::ClosedToggle(hi) => {
+                    Row::ClosedToggle(hi, grouped) => {
                         let e = &self.hosts[*hi];
                         let arrow = if e.closed_expanded { "▾" } else { "▸" };
                         (
                             format!("{arrow} ⟲ closed ({})", e.closed.len()),
                             None,
-                            24.0,
+                            g(24.0, *grouped),
                             Color32::from_rgb(150, 130, 90),
                             false,
                         )
                     }
-                    Row::Closed(hi, ci) => {
+                    Row::Closed(hi, ci, grouped) => {
                         let c = &self.hosts[*hi].closed[ci.to_owned()];
                         let age = c
                             .closed_at
@@ -1187,17 +1406,17 @@ impl App {
                         (
                             format!("⟲ {}", c.name),
                             Some(hint),
-                            36.0,
+                            g(36.0, *grouped),
                             Color32::from_gray(150),
                             false,
                         )
                     }
-                    Row::RestoreAll(hi) => {
+                    Row::RestoreAll(hi, grouped) => {
                         let n = self.hosts[*hi].closed.len();
                         (
                             format!("⟲ restore all ({n})"),
                             None,
-                            36.0,
+                            g(36.0, *grouped),
                             Color32::from_rgb(150, 130, 90),
                             false,
                         )
@@ -1217,7 +1436,7 @@ impl App {
                 }
                 // A session with a progress log gets a small amber dot after
                 // its name, so you can see which of many have context waiting.
-                let badge = matches!(row, Row::Session(hi, si) if self.hosts[*hi].sessions[*si].has_log);
+                let badge = matches!(row, Row::Session(hi, si, _) if self.hosts[*hi].sessions[*si].has_log);
 
                 let text_rect = ui.painter().text(
                     rect.left_center() + Vec2::new(indent, 0.0),
@@ -1251,19 +1470,23 @@ impl App {
                 if response.clicked() {
                     self.tree_cursor = i;
                     match row {
-                        Row::Host(hi) => toggle = Some(*hi),
-                        Row::Session(hi, si) => {
+                        Row::Host(hi, _) => toggle = Some(*hi),
+                        Row::Session(hi, si, _) => {
                             let e = &self.hosts[*hi];
                             pending =
                                 Some((e.host.name.clone(), e.sessions[*si].name.clone()));
                         }
-                        Row::NewSession(hi) => new_modal = Some(*hi),
-                        Row::ClosedToggle(hi) => toggle_closed = Some(*hi),
-                        Row::Closed(hi, ci) => {
+                        Row::NewSession(hi, _) => new_modal = Some(*hi),
+                        Row::ClosedToggle(hi, _) => toggle_closed = Some(*hi),
+                        Row::Closed(hi, ci, _) => {
                             restore_one =
                                 Some((*hi, self.hosts[*hi].closed[*ci].name.clone()));
                         }
-                        Row::RestoreAll(hi) => restore_all = Some(*hi),
+                        Row::RestoreAll(hi, _) => restore_all = Some(*hi),
+                        Row::ManagerHeader(m) => toggle_group = Some(format!("mgr:{m}")),
+                        Row::CategoryHeader(m, c, _) => {
+                            toggle_group = Some(format!("cat:{m}/{c}"))
+                        }
                     }
                 }
             }
@@ -1271,6 +1494,9 @@ impl App {
 
         if let Some(hi) = toggle {
             self.hosts[hi].expanded = !self.hosts[hi].expanded;
+        }
+        if let Some(key) = toggle_group {
+            self.toggle_group(&key);
         }
         if let Some(hi) = toggle_closed {
             self.hosts[hi].closed_expanded = !self.hosts[hi].closed_expanded;

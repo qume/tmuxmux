@@ -34,6 +34,14 @@ architecture (developed and tested on Linux, including Asahi/aarch64).
 - **Live hints** — the sidebar shows what's running in each session
   ("claude", "vim", …) and refreshes itself from the same snapshots; F5
   forces a poll.
+- **App-manager integration** — point tmuxmux at a [geocam apps-manager]
+  instance (`[[app_managers]]` = domain + username/password) and on launch it
+  logs in, pulls every app you can reach, and materialises each as a host —
+  grouped in the sidebar as **instance → mine / shared / public → app →
+  sessions**, with each app's live status. Discovered apps are written back
+  into `hosts.toml` below an auto-generated marker (new ones added, existing
+  kept, vanished ones marked closed); your hand-written hosts above the marker
+  are never touched. Multiple instances supported.
 - **Progress pane** — a third pane, right of the terminal, that live-renders
   a `PROGRESS.md` at the git root of the active session's working directory
   (fetched over ssh for remote sessions). It appears only when that file
