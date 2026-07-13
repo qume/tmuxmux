@@ -91,19 +91,18 @@ pub fn fetch(m: &AppManager) -> FetchResult {
         return result;
     };
 
-    // 2. connect-list
-    let data = match agent
+    let auth = format!("Bearer {token}");
+
+    // 2. connect-list — the narrow stable endpoint. Older instances (e.g. a
+    // dev deployment behind prod) don't have it and 404/422 the path; in that
+    // case fall back to the full /api/apps, which carries the same buckets.
+    let connect = agent
         .get(&format!("{base}/api/apps/connect-list"))
-        .set("Authorization", &format!("Bearer {token}"))
-        .call()
-    {
-        Ok(resp) => match resp.into_json::<serde_json::Value>() {
-            Ok(v) => v,
-            Err(e) => {
-                result.error = Some(format!("connect-list: bad json: {e}"));
-                return result;
-            }
-        },
+        .set("Authorization", &auth)
+        .call();
+    let mut data: Option<serde_json::Value> = match connect {
+        Ok(resp) => resp.into_json::<serde_json::Value>().ok(),
+        Err(ureq::Error::Status(404, _)) | Err(ureq::Error::Status(422, _)) => None,
         Err(ureq::Error::Status(code, _)) => {
             result.error = Some(format!("connect-list: HTTP {code}"));
             return result;
@@ -114,52 +113,92 @@ pub fn fetch(m: &AppManager) -> FetchResult {
         }
     };
 
-    if let Some(n) = data
-        .get("instance")
-        .and_then(|i| i.get("name"))
-        .and_then(|n| n.as_str())
-    {
-        if m.name.is_none() && !n.is_empty() {
-            result.instance_name = n.to_string();
+    // New-shape response present?
+    if let Some(d) = &data {
+        if d.get("categories").is_some() {
+            if let Some(n) = d
+                .get("instance")
+                .and_then(|i| i.get("name"))
+                .and_then(|n| n.as_str())
+            {
+                if m.name.is_none() && !n.is_empty() {
+                    result.instance_name = n.to_string();
+                }
+            }
+            for cat in ["mine", "shared", "public"] {
+                push_bucket(d.get("categories").and_then(|c| c.get(cat)), cat, &mut result.apps);
+            }
+            return result;
         }
+        data = None; // response existed but wasn't the new shape → legacy
     }
 
-    for cat in ["mine", "shared", "public"] {
-        let Some(arr) = data
-            .get("categories")
-            .and_then(|c| c.get(cat))
-            .and_then(|a| a.as_array())
-        else {
-            continue;
-        };
-        for a in arr {
-            let name = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let ssh = a.get("ssh_command").and_then(|v| v.as_str()).unwrap_or("");
-            if name.is_empty() || ssh.is_empty() {
-                continue;
+    // Legacy fallback: GET /api/apps → {my_apps, shared_with_me, shared_with_everyone}
+    let legacy = match agent
+        .get(&format!("{base}/api/apps"))
+        .set("Authorization", &auth)
+        .call()
+    {
+        Ok(resp) => match resp.into_json::<serde_json::Value>() {
+            Ok(v) => v,
+            Err(e) => {
+                result.error = Some(format!("/api/apps: bad json: {e}"));
+                return result;
             }
-            result.apps.push(DiscoveredApp {
-                name: name.to_string(),
-                status: a
-                    .get("status")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown")
-                    .to_string(),
-                ssh_command: ssh.to_string(),
-                owner: a
-                    .get("owner")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                host: a
-                    .get("host")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string()),
-                category: cat.to_string(),
-            });
+        },
+        Err(ureq::Error::Status(code, _)) => {
+            result.error = Some(format!("/api/apps: HTTP {code}"));
+            return result;
         }
+        Err(e) => {
+            result.error = Some(format!("/api/apps: {e}"));
+            return result;
+        }
+    };
+    for (key, cat) in [
+        ("my_apps", "mine"),
+        ("shared_with_me", "shared"),
+        ("shared_with_everyone", "public"),
+    ] {
+        push_bucket(legacy.get(key), cat, &mut result.apps);
     }
     result
+}
+
+/// Parse one category array into DiscoveredApps (works for both the connect-list
+/// and legacy /api/apps shapes — both carry name/status/ssh_command/host, and
+/// owner under either `owner` or `owner_username`).
+fn push_bucket(arr: Option<&serde_json::Value>, category: &str, out: &mut Vec<DiscoveredApp>) {
+    let Some(arr) = arr.and_then(|a| a.as_array()) else {
+        return;
+    };
+    for a in arr {
+        let name = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let ssh = a.get("ssh_command").and_then(|v| v.as_str()).unwrap_or("");
+        if name.is_empty() || ssh.is_empty() {
+            continue;
+        }
+        out.push(DiscoveredApp {
+            name: name.to_string(),
+            status: a
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string(),
+            ssh_command: ssh.to_string(),
+            owner: a
+                .get("owner")
+                .and_then(|v| v.as_str())
+                .or_else(|| a.get("owner_username").and_then(|v| v.as_str()))
+                .unwrap_or("")
+                .to_string(),
+            host: a
+                .get("host")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            category: category.to_string(),
+        });
+    }
 }
 
 /// Merge fetch results with the previously-known auto hosts into the new
