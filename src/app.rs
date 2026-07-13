@@ -358,15 +358,28 @@ impl App {
 
     // ---------- snapshot polling ----------
 
-    /// Snapshot every host that isn't already being polled.
+    /// Snapshot due hosts. Hand-written hosts are always polled; app-manager
+    /// hosts only when their row is expanded or currently active — so a config
+    /// with dozens of apps doesn't fire dozens of ssh connections on launch or
+    /// every poll (which chokes on a flaky connection). Expanding an app
+    /// triggers an immediate poll (see `poll_after_expand`).
     pub fn poll_now(&mut self) {
+        let active_host = self
+            .active_key
+            .as_deref()
+            .and_then(|k| k.split_once('/'))
+            .map(|(h, _)| h.to_string());
         let due: Vec<Host> = self
-            .config
             .hosts
             .iter()
             // Closed apps are gone — don't waste a connection attempt on them.
-            .filter(|h| !h.closed && !self.in_flight.contains(&h.name))
-            .cloned()
+            .filter(|e| !e.host.closed && !self.in_flight.contains(&e.host.name))
+            .filter(|e| {
+                e.host.manager.is_none()
+                    || e.expanded
+                    || active_host.as_deref() == Some(e.host.name.as_str())
+            })
+            .map(|e| e.host.clone())
             .collect();
         for h in &due {
             self.in_flight.insert(h.name.clone());
@@ -1224,7 +1237,11 @@ impl App {
                 Row::Session(..) => {}
             },
             egui::Key::ArrowRight => match rows[self.tree_cursor].clone() {
-                Row::Host(hi, _) => self.hosts[hi].expanded = true,
+                Row::Host(hi, _) => {
+                    if !self.hosts[hi].expanded {
+                        self.toggle_host_expanded(hi);
+                    }
+                }
                 Row::ClosedToggle(hi, _) => self.hosts[hi].closed_expanded = true,
                 Row::ManagerHeader(m) => {
                     self.collapsed_groups.remove(&format!("mgr:{m}"));
@@ -1236,7 +1253,7 @@ impl App {
             },
             egui::Key::Enter => match rows[self.tree_cursor].clone() {
                 Row::Host(hi, _) => {
-                    self.hosts[hi].expanded = !self.hosts[hi].expanded;
+                    self.toggle_host_expanded(hi);
                 }
                 Row::Session(hi, si, _) => {
                     let h = self.hosts[hi].host.name.clone();
@@ -1270,6 +1287,15 @@ impl App {
     fn toggle_group(&mut self, key: &str) {
         if !self.collapsed_groups.remove(key) {
             self.collapsed_groups.insert(key.to_string());
+        }
+    }
+
+    /// Toggle a host's expansion; if it just opened, snapshot it now so its
+    /// sessions populate immediately (app hosts aren't polled while collapsed).
+    fn toggle_host_expanded(&mut self, hi: usize) {
+        self.hosts[hi].expanded = !self.hosts[hi].expanded;
+        if self.hosts[hi].expanded {
+            self.poll_now();
         }
     }
 
@@ -1493,7 +1519,7 @@ impl App {
         });
 
         if let Some(hi) = toggle {
-            self.hosts[hi].expanded = !self.hosts[hi].expanded;
+            self.toggle_host_expanded(hi);
         }
         if let Some(key) = toggle_group {
             self.toggle_group(&key);
