@@ -34,6 +34,9 @@ use app::App;
 ///   restore-all:HOST      restore every cached session on a host
 ///   dump-live:HOST        print the live session list to stdout
 ///   dump-closed:HOST      print the cached/closed session list to stdout
+///   hide:HOST/SESSION     hide a live session (client-side view preference)
+///   unhide:HOST/SESSION   unhide a session
+///   dump-hidden:HOST      print the live-and-hidden session list to stdout
 ///   quit                  exit the app
 #[derive(Debug, Clone)]
 enum Step {
@@ -58,6 +61,9 @@ enum Step {
     DumpLive(String),
     DumpClosed(String),
     ExpandClosed(String),
+    Hide(String, String),
+    Unhide(String, String),
+    DumpHidden(String),
     Quit,
 }
 
@@ -111,6 +117,15 @@ fn parse_script(s: &str) -> Vec<Step> {
             "dump-live" => Some(Step::DumpLive(arg.trim().to_string())),
             "dump-closed" => Some(Step::DumpClosed(arg.trim().to_string())),
             "expand-closed" => Some(Step::ExpandClosed(arg.trim().to_string())),
+            "hide" => arg
+                .trim()
+                .split_once('/')
+                .map(|(h, s)| Step::Hide(h.to_string(), s.to_string())),
+            "unhide" => arg
+                .trim()
+                .split_once('/')
+                .map(|(h, s)| Step::Unhide(h.to_string(), s.to_string())),
+            "dump-hidden" => Some(Step::DumpHidden(arg.trim().to_string())),
             "print-selection" => Some(Step::PrintSelection),
             "print-clipboard" => Some(Step::PrintClipboard),
             "quit" => Some(Step::Quit),
@@ -332,6 +347,22 @@ impl MainApp {
                         .unwrap_or_else(|| "?unknown-host".into());
                     println!("CLOSED:{h}>>>{line}<<<");
                 }
+                Step::Hide(h, s) => match self.inner.host_index(&h) {
+                    Some(hi) => self.inner.hide_session(hi, &s),
+                    None => eprintln!("script: unknown host {h}"),
+                },
+                Step::Unhide(h, s) => match self.inner.host_index(&h) {
+                    Some(hi) => self.inner.unhide_session(hi, &s),
+                    None => eprintln!("script: unknown host {h}"),
+                },
+                Step::DumpHidden(h) => {
+                    let line = self
+                        .inner
+                        .host_index(&h)
+                        .map(|hi| self.inner.hosts[hi].hidden.join(","))
+                        .unwrap_or_else(|| "?unknown-host".into());
+                    println!("HIDDEN:{h}>>>{line}<<<");
+                }
                 Step::PrintClipboard => {
                     let text = arboard::Clipboard::new()
                         .and_then(|mut c| c.get_text())
@@ -378,6 +409,9 @@ fn main() {
     let mut cache_interval: Option<u64> = None;
     let mut snap_host: Option<String> = None;
     let mut fetch_log_arg: Option<String> = None;
+    let mut hide_arg: Option<String> = None;
+    let mut unhide_arg: Option<String> = None;
+    let mut dump_hidden_host: Option<String> = None;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -398,17 +432,31 @@ fn main() {
                 // Debug: fetch the progress log for HOST:CWD and print it.
                 fetch_log_arg = it.next().cloned();
             }
+            "--hide" => {
+                // Debug: hide a session in the cache (HOST/NAME) and exit.
+                hide_arg = it.next().cloned();
+            }
+            "--unhide" => {
+                // Debug: unhide a session in the cache (HOST/NAME) and exit.
+                unhide_arg = it.next().cloned();
+            }
+            "--dump-hidden" => {
+                // Debug: print the persisted hidden set for HOST and exit.
+                dump_hidden_host = it.next().cloned();
+            }
             "--db" => db_path = it.next().map(PathBuf::from),
             "--cache-interval" => cache_interval = it.next().and_then(|s| s.parse().ok()),
             "--help" | "-h" => {
                 println!(
                     "usage: tmuxmux [hosts.toml] [--list] [--dump-cache] [--db PATH]\n\
-                     [--cache-interval SECS] [--script 'step;;step;;...']\n\
+                     [--cache-interval SECS] [--hide HOST/NAME] [--unhide HOST/NAME]\n\
+                     [--dump-hidden HOST] [--script 'step;;step;;...']\n\
                      script steps: sleep:MS attach:HOST/SESSION keys:TEXT shot:PATH\n\
                      select:R1,C1,R2,C2 copy paste print-selection print-clipboard\n\
                      newmodal:HOST modal-accept snapshot-now restore:HOST/NAME\n\
                      restoremodal:HOST/NAME restore-all:HOST dump-live:HOST\n\
-                     dump-closed:HOST quit"
+                     dump-closed:HOST hide:HOST/NAME unhide:HOST/NAME\n\
+                     dump-hidden:HOST quit"
                 );
                 return;
             }
@@ -519,6 +567,36 @@ fn main() {
             .unwrap_or_else(db::default_db_path);
         match db::Db::open(&path) {
             Ok(d) => print!("{}", d.dump()),
+            Err(e) => eprintln!("cannot open {}: {e}", path.display()),
+        }
+        return;
+    }
+
+    // Headless hidden-session ops against the cache (no GUI, no display).
+    if hide_arg.is_some() || unhide_arg.is_some() || dump_hidden_host.is_some() {
+        let path = db_path
+            .clone()
+            .or_else(|| {
+                cfg.cache
+                    .as_ref()
+                    .and_then(|c| c.path.as_ref())
+                    .map(PathBuf::from)
+            })
+            .unwrap_or_else(db::default_db_path);
+        match db::Db::open(&path) {
+            Ok(d) => {
+                if let Some(spec) = hide_arg.as_deref().and_then(|s| s.split_once('/')) {
+                    d.hide_session(spec.0, spec.1);
+                    println!("hid {}/{}", spec.0, spec.1);
+                }
+                if let Some(spec) = unhide_arg.as_deref().and_then(|s| s.split_once('/')) {
+                    d.unhide_session(spec.0, spec.1);
+                    println!("unhid {}/{}", spec.0, spec.1);
+                }
+                if let Some(h) = dump_hidden_host {
+                    println!("HIDDEN:{h}>>>{}<<<", d.hidden_for_host(&h).join(","));
+                }
+            }
             Err(e) => eprintln!("cannot open {}: {e}", path.display()),
         }
         return;

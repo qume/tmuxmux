@@ -81,6 +81,12 @@ impl Db {
                 cmdline TEXT,
                 cwd TEXT,
                 UNIQUE(session_id, window_index, pane_index)
+            );
+            CREATE TABLE IF NOT EXISTS hidden_sessions (
+                host TEXT NOT NULL,
+                name TEXT NOT NULL,
+                hidden_at INTEGER,
+                UNIQUE(host, name)
             );",
         )?;
         Ok(Db { conn })
@@ -231,6 +237,41 @@ impl Db {
              WHERE host = ?1 AND name = ?2",
             params![host, name, now],
         );
+    }
+
+    /// Hide a live session from the sidebar. Purely a client-side view
+    /// preference — the tmux session keeps running; we just stop listing it.
+    /// Keyed by (host, name), so it survives restarts and syncs with the set
+    /// surfaced under the "⊘ hidden" group.
+    pub fn hide_session(&self, host: &str, name: &str) {
+        let _ = self.conn.execute(
+            "INSERT INTO hidden_sessions (host, name, hidden_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(host, name) DO UPDATE SET hidden_at = excluded.hidden_at",
+            params![host, name, now_epoch()],
+        );
+    }
+
+    /// Undo `hide_session`: the session reappears in the normal list.
+    pub fn unhide_session(&self, host: &str, name: &str) {
+        let _ = self.conn.execute(
+            "DELETE FROM hidden_sessions WHERE host = ?1 AND name = ?2",
+            params![host, name],
+        );
+    }
+
+    /// Names the user has hidden on `host` (persisted set, not filtered by
+    /// what's currently live — the caller intersects with the fresh snapshot).
+    pub fn hidden_for_host(&self, host: &str) -> Vec<String> {
+        let mut stmt = match self
+            .conn
+            .prepare("SELECT name FROM hidden_sessions WHERE host = ?1 ORDER BY name")
+        {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        stmt.query_map(params![host], |r| r.get(0))
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
     }
 
     /// Drop closed sessions not seen for `days`.

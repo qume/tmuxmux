@@ -40,6 +40,15 @@ pub struct HostEntry {
     pub sessions: Vec<SessionInfo>,
     pub closed: Vec<db::ClosedSession>,
     pub closed_expanded: bool,
+    /// Names the user chose to hide on this host (persisted view preference).
+    /// Filters `sessions` and drives the "⊘ hidden" group.
+    pub hidden_set: HashSet<String>,
+    /// Hidden sessions that are *currently live* on the host — the subset of
+    /// `hidden_set` present in the latest snapshot, rendered under the group.
+    /// A session that no longer exists on the host drops out of here (but
+    /// stays in `hidden_set` so it re-hides if it comes back).
+    pub hidden: Vec<String>,
+    pub hidden_expanded: bool,
     pub loaded: bool,
     pub error: Option<String>,
     pub expanded: bool,
@@ -60,6 +69,10 @@ enum Row {
     Closed(usize, usize, bool),
     /// "⟲ restore all" bulk action.
     RestoreAll(usize, bool),
+    /// "⊘ hidden (N)" toggle for the client-side hidden-session group.
+    HiddenToggle(usize, bool),
+    /// One hidden (still-live) session, clickable to unhide.
+    Hidden(usize, usize, bool),
     /// App-manager instance header (domain key).
     ManagerHeader(String),
     /// Category header within an instance (domain, category, count).
@@ -213,6 +226,12 @@ impl App {
                     .map(|d| d.closed_sessions(&h.name))
                     .unwrap_or_default(),
                 closed_expanded: false,
+                hidden_set: db
+                    .as_ref()
+                    .map(|d| d.hidden_for_host(&h.name).into_iter().collect())
+                    .unwrap_or_default(),
+                hidden: Vec::new(),
+                hidden_expanded: false,
                 loaded: false,
                 error: None,
                 // Apps (from an app-manager) start collapsed to keep the
@@ -341,6 +360,13 @@ impl App {
                         .as_ref()
                         .map(|d| d.closed_sessions(&host.name))
                         .unwrap_or_default(),
+                    hidden_set: self
+                        .db
+                        .as_ref()
+                        .map(|d| d.hidden_for_host(&host.name).into_iter().collect())
+                        .unwrap_or_default(),
+                    hidden: Vec::new(),
+                    hidden_expanded: false,
                     expanded: host.manager.is_none(),
                     host: host.clone(),
                     sessions: Vec::new(),
@@ -511,15 +537,27 @@ impl App {
             entry.error = Some(err);
         } else {
             entry.error = None;
+            // Hidden sessions are filtered out of the visible list but keep
+            // running on the host. The hidden group only shows names that are
+            // both hidden *and* present in this snapshot — vanished sessions
+            // drop out of the group (yet stay in the persisted set).
+            let hidden_set = entry.hidden_set.clone();
             entry.sessions = result
                 .sessions
                 .iter()
+                .filter(|s| !hidden_set.contains(&s.name))
                 .map(|s| SessionInfo {
                     name: s.name.clone(),
                     hint: session_hint(s),
                     cwd: active_cwd(s),
                     has_log: s.has_log,
                 })
+                .collect();
+            entry.hidden = result
+                .sessions
+                .iter()
+                .map(|s| s.name.clone())
+                .filter(|n| hidden_set.contains(n))
                 .collect();
             if let Some(db) = self.db.as_mut() {
                 if let Err(e) = db.apply_snapshot(&result.host_name, &result.sessions, now) {
@@ -827,6 +865,45 @@ impl App {
                 });
             }
         });
+    }
+
+    /// Hide a live session from this host's normal list. The tmux session is
+    /// untouched; this only records a client-side view preference (persisted)
+    /// and moves the row into the "⊘ hidden" group. We update the in-memory
+    /// lists immediately so the row disappears without waiting for a poll.
+    pub fn hide_session(&mut self, host_idx: usize, name: &str) {
+        let host_name = self.hosts[host_idx].host.name.clone();
+        if let Some(db) = self.db.as_ref() {
+            db.hide_session(&host_name, name);
+        }
+        let entry = &mut self.hosts[host_idx];
+        entry.hidden_set.insert(name.to_string());
+        entry.sessions.retain(|s| s.name != name);
+        if !entry.hidden.iter().any(|n| n == name) {
+            entry.hidden.push(name.to_string());
+        }
+        self.status = format!("hid {host_name}/{name}");
+    }
+
+    /// Undo `hide_session`: drop the persisted preference and put the session
+    /// back in the visible list. The next snapshot restores its hint/cwd.
+    pub fn unhide_session(&mut self, host_idx: usize, name: &str) {
+        let host_name = self.hosts[host_idx].host.name.clone();
+        if let Some(db) = self.db.as_ref() {
+            db.unhide_session(&host_name, name);
+        }
+        let entry = &mut self.hosts[host_idx];
+        entry.hidden_set.remove(name);
+        entry.hidden.retain(|n| n != name);
+        if !entry.sessions.iter().any(|s| s.name == name) {
+            entry.sessions.push(SessionInfo {
+                name: name.to_string(),
+                hint: None,
+                cwd: None,
+                has_log: false,
+            });
+        }
+        self.status = format!("unhid {host_name}/{name}");
     }
 
     pub fn delete_cached_session(&mut self, host_idx: usize, name: &str) {
@@ -1205,6 +1282,14 @@ impl App {
                     }
                 }
             }
+            if !entry.hidden.is_empty() {
+                rows.push(Row::HiddenToggle(hi, grouped));
+                if entry.hidden_expanded {
+                    for hj in 0..entry.hidden.len() {
+                        rows.push(Row::Hidden(hi, hj, grouped));
+                    }
+                }
+            }
         }
     }
 
@@ -1228,6 +1313,9 @@ impl App {
                 Row::ClosedToggle(hi, _) | Row::Closed(hi, _, _) | Row::RestoreAll(hi, _) => {
                     self.hosts[hi].closed_expanded = false;
                 }
+                Row::HiddenToggle(hi, _) | Row::Hidden(hi, _, _) => {
+                    self.hosts[hi].hidden_expanded = false;
+                }
                 Row::ManagerHeader(m) => {
                     self.collapsed_groups.insert(format!("mgr:{m}"));
                 }
@@ -1243,6 +1331,7 @@ impl App {
                     }
                 }
                 Row::ClosedToggle(hi, _) => self.hosts[hi].closed_expanded = true,
+                Row::HiddenToggle(hi, _) => self.hosts[hi].hidden_expanded = true,
                 Row::ManagerHeader(m) => {
                     self.collapsed_groups.remove(&format!("mgr:{m}"));
                 }
@@ -1273,6 +1362,13 @@ impl App {
                 Row::RestoreAll(hi, _) => {
                     self.open_restore_all_modal(hi);
                 }
+                Row::HiddenToggle(hi, _) => {
+                    self.hosts[hi].hidden_expanded = !self.hosts[hi].hidden_expanded;
+                }
+                Row::Hidden(hi, hj, _) => {
+                    let name = self.hosts[hi].hidden[hj].clone();
+                    self.unhide_session(hi, &name);
+                }
                 Row::ManagerHeader(m) => {
                     self.toggle_group(&format!("mgr:{m}"));
                 }
@@ -1280,6 +1376,14 @@ impl App {
                     self.toggle_group(&format!("cat:{m}/{c}"));
                 }
             },
+            // Delete hides the live session under the cursor (unbound key, no
+            // conflict with the vim-style j/k/arrows). Unhide from the group.
+            egui::Key::Delete => {
+                if let Row::Session(hi, si, _) = rows[self.tree_cursor].clone() {
+                    let name = self.hosts[hi].sessions[si].name.clone();
+                    self.hide_session(hi, &name);
+                }
+            }
             _ => {}
         }
     }
@@ -1317,6 +1421,9 @@ impl App {
         let mut new_modal: Option<usize> = None;
         let mut restore_one: Option<(usize, String)> = None;
         let mut restore_all: Option<usize> = None;
+        let mut hide_one: Option<(usize, String)> = None;
+        let mut unhide_one: Option<(usize, String)> = None;
+        let mut toggle_hidden: Option<usize> = None;
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             for (i, row) in rows.iter().enumerate() {
@@ -1447,6 +1554,27 @@ impl App {
                             false,
                         )
                     }
+                    Row::HiddenToggle(hi, grouped) => {
+                        let e = &self.hosts[*hi];
+                        let arrow = if e.hidden_expanded { "▾" } else { "▸" };
+                        (
+                            format!("{arrow} ⊘ hidden ({})", e.hidden.len()),
+                            None,
+                            g(24.0, *grouped),
+                            Color32::from_gray(120),
+                            false,
+                        )
+                    }
+                    Row::Hidden(hi, hj, grouped) => {
+                        let name = self.hosts[*hi].hidden[hj.to_owned()].clone();
+                        (
+                            format!("⊘ {name}"),
+                            Some("unhide".to_string()),
+                            g(36.0, *grouped),
+                            Color32::from_gray(140),
+                            false,
+                        )
+                    }
                 };
 
                 let desired = Vec2::new(ui.available_width(), 20.0);
@@ -1493,7 +1621,41 @@ impl App {
                     );
                 }
 
-                if response.clicked() {
+                // A small "×" appears at the right edge of a live session row
+                // on hover; clicking it hides the session (client-side only).
+                // Its own hit-area is interacted separately so the row-click
+                // that would attach is suppressed when the × is pressed.
+                let mut hide_clicked = false;
+                if let Row::Session(hi, si, _) = row {
+                    if response.hovered() {
+                        let center = egui::pos2(rect.right() - 12.0, rect.center().y);
+                        let x_rect = Rect::from_center_size(center, Vec2::splat(16.0));
+                        let x_resp = ui.interact(
+                            x_rect,
+                            ui.make_persistent_id(("hide-x", i)),
+                            Sense::click(),
+                        );
+                        let x_color = if x_resp.hovered() {
+                            Color32::from_rgb(235, 120, 120)
+                        } else {
+                            Color32::from_gray(130)
+                        };
+                        ui.painter().text(
+                            center,
+                            egui::Align2::CENTER_CENTER,
+                            "×",
+                            FontId::monospace(14.0),
+                            x_color,
+                        );
+                        if x_resp.clicked() {
+                            hide_one =
+                                Some((*hi, self.hosts[*hi].sessions[*si].name.clone()));
+                            hide_clicked = true;
+                        }
+                    }
+                }
+
+                if response.clicked() && !hide_clicked {
                     self.tree_cursor = i;
                     match row {
                         Row::Host(hi, _) => toggle = Some(*hi),
@@ -1509,6 +1671,11 @@ impl App {
                                 Some((*hi, self.hosts[*hi].closed[*ci].name.clone()));
                         }
                         Row::RestoreAll(hi, _) => restore_all = Some(*hi),
+                        Row::HiddenToggle(hi, _) => toggle_hidden = Some(*hi),
+                        Row::Hidden(hi, hj, _) => {
+                            unhide_one =
+                                Some((*hi, self.hosts[*hi].hidden[*hj].clone()));
+                        }
                         Row::ManagerHeader(m) => toggle_group = Some(format!("mgr:{m}")),
                         Row::CategoryHeader(m, c, _) => {
                             toggle_group = Some(format!("cat:{m}/{c}"))
@@ -1538,6 +1705,15 @@ impl App {
         }
         if let Some(hi) = restore_all {
             self.open_restore_all_modal(hi);
+        }
+        if let Some(hi) = toggle_hidden {
+            self.hosts[hi].hidden_expanded = !self.hosts[hi].hidden_expanded;
+        }
+        if let Some((hi, name)) = hide_one {
+            self.hide_session(hi, &name);
+        }
+        if let Some((hi, name)) = unhide_one {
+            self.unhide_session(hi, &name);
         }
     }
 
@@ -2124,7 +2300,7 @@ impl App {
                 ui.add_space(6.0);
                 ui.colored_label(
                     Color32::from_gray(120),
-                    "drag:select  C-S-c:copy  C-S-v:paste  C-]/\\:cycle  C-S-e:tree  C-+/-:font  C-S-l:log  F2:sidebar  F5:refresh  C-S-q:quit",
+                    "drag:select  C-S-c:copy  C-S-v:paste  C-]/\\:cycle  C-S-e:tree  Del:hide  C-+/-:font  C-S-l:log  F2:sidebar  F5:refresh  C-S-q:quit",
                 );
             });
         });
