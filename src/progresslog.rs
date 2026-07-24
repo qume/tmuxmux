@@ -73,14 +73,13 @@ pub fn fetch_log(
         return result;
     }
     let argv = build_shell_command(&host, &fetch_script(&cwd, &filename));
-    let output = match std::process::Command::new(&argv[0]).args(&argv[1..]).output() {
-        Ok(o) => o,
+    let stdout = match crate::terminal::run_argv(argv) {
+        Ok(s) => s,
         Err(e) => {
             log::warn!("log fetch failed for {}: {e}", host.name);
             return result;
         }
     };
-    let stdout = String::from_utf8_lossy(&output.stdout);
     let Some(idx) = stdout.find(MARK) else {
         // No marker => the command didn't complete (connection issue); leave
         // the previous content in place by signalling "no update".

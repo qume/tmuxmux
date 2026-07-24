@@ -95,27 +95,22 @@ const LOG_SECTION: &str = "echo @MARK@; \
 
 pub fn take_snapshot(host: Host, log_filename: Option<&str>) -> SnapshotResult {
     let argv = build_shell_command(&host, &snapshot_command(log_filename));
-    let mut cmd = std::process::Command::new(&argv[0]);
-    cmd.args(&argv[1..]);
-    let output = match cmd.output() {
-        Ok(o) => o,
+    let stdout = match crate::terminal::run_argv(argv) {
+        Ok(s) => s.replace('\r', ""),
         Err(e) => {
             return SnapshotResult {
                 host_name: host.name,
                 sessions: vec![],
-                error: Some(e.to_string()),
+                error: Some(e),
             }
         }
     };
 
-    let stdout = String::from_utf8_lossy(&output.stdout).replace('\r', "");
     if !stdout.contains(PS_MARKER) {
         // The shell never ran on the far side — connection-level failure.
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let msg = stderr
+        let msg = stdout
             .lines()
             .last()
-            .or_else(|| stdout.lines().last())
             .unwrap_or("connection failed")
             .to_string();
         return SnapshotResult {

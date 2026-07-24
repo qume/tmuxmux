@@ -1,10 +1,23 @@
 # tmuxmux — progress
 
-> **Now:** App-manager integration landed — tmuxmux pulls apps from a geocam apps-manager instance and shows them grouped instance → mine/shared/public → app → sessions. Verified end-to-end against the live API. Next move: wire it into the real ~/sync/hosts.toml with your own login and live with it.
-> **Health:** working — login + connect-list fetch, reconcile/mark-closed, write-back preserving hand-written hosts, and the grouped sidebar all verified against apps-manager-app.geocam.io.
-> **Watch out:** enabling an [[app_managers]] entry makes tmuxmux rewrite hosts.toml on launch (only below the auto marker — hand-written hosts above are safe). Every non-closed app is snapshotted on the poll cycle, so a manager with many apps means many cloudflared ssh connections per cycle.
+> **Now:** Cross-platform-ready and much lighter. sshpass is no longer invoked (tmuxmux types the password itself), so the same commands work on Windows; idle CPU fixed from ~50% to ~0%; hide/unhide sessions added. Next move: try the Windows build from CI, and consider SSH keys to get passwords out of the config entirely.
+> **Health:** working — verified the sshpass-free paths (interactive attach + snapshot) against live geocam apps with sshpass shadowed by a failing fake; idle CPU measured ~0%.
+> **Watch out:** enabling an [[app_managers]] entry makes tmuxmux rewrite hosts.toml on launch (only below the auto marker). Apps are only snapshotted when their sidebar row is expanded, to keep connection fan-out low on flaky links.
 
 ## Log
+
+### 2026-07-11 · sshpass-free (Windows-ready), CPU fix, hide sessions
+Three things. (1) tmuxmux no longer shells out to `sshpass` — it strips the
+`sshpass -p PW` prefix and types the password into the pty itself (interactive
+attach) or via a pty-capture helper (snapshot/log). Same command now works on
+Windows, where sshpass doesn't exist. Proven by shadowing sshpass with a
+failing fake and confirming attach + snapshot still connect. (2) Idle CPU was
+~50% — the loop force-repainted the terminal at 60fps always; now
+activity-based (fast only after real input/output), idle ~0%. (3) Hidden
+sessions: hover-× or Delete to hide other people's processes; unhide from a
+'⊘ hidden' group; persisted in sqlite.
+
+**Next:** grab the Windows binary from CI and smoke-test it; if we want passwords out of hosts.toml, do SSH-key injection on the containers (apps-manager side).
 
 ### 2026-07-11 · App-manager integration
 tmuxmux can now pull apps from geocam apps-manager instances. Config is

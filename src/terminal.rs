@@ -1,7 +1,129 @@
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::time::{Duration, Instant};
 
 use crate::acs::AcsFilter;
+
+/// Run a shell-command argv and return combined stdout+stderr. Commands that
+/// start with `sshpass` go through the pty-capture path (feeds the password,
+/// never invokes sshpass — Windows-safe); everything else uses a plain
+/// subprocess, which is cheaper and unchanged.
+pub fn run_argv(argv: Vec<String>) -> Result<String, String> {
+    if argv.first().map(|s| s == "sshpass").unwrap_or(false) {
+        let (out, _ok) = run_capture(argv, None, Duration::from_secs(25));
+        Ok(out)
+    } else {
+        let output = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .output()
+            .map_err(|e| e.to_string())?;
+        let mut s = String::from_utf8_lossy(&output.stdout).to_string();
+        s.push_str(&String::from_utf8_lossy(&output.stderr));
+        Ok(s)
+    }
+}
+
+/// Run a command to completion capturing its output, feeding an
+/// `sshpass -p …` password on the prompt via a pty — so `sshpass` itself is
+/// never invoked (it doesn't exist on Windows). Used for the non-interactive
+/// ssh calls (snapshot, log fetch). Returns (combined stdout+stderr, success).
+pub fn run_capture(
+    argv: Vec<String>,
+    env: Option<HashMap<String, String>>,
+    timeout: Duration,
+) -> (String, bool) {
+    let (argv, password) = strip_sshpass(argv);
+    if argv.is_empty() {
+        return (String::new(), false);
+    }
+    let pair = match native_pty_system().openpty(PtySize {
+        rows: 50,
+        cols: 220,
+        pixel_width: 0,
+        pixel_height: 0,
+    }) {
+        Ok(p) => p,
+        Err(_) => return (String::new(), false),
+    };
+    #[cfg(unix)]
+    {
+        if let Some(fd) = pair.master.as_raw_fd() {
+            unsafe {
+                let f = libc::fcntl(fd, libc::F_GETFL, 0);
+                libc::fcntl(fd, libc::F_SETFL, f | libc::O_NONBLOCK);
+            }
+        }
+    }
+    let mut reader = match pair.master.try_clone_reader() {
+        Ok(r) => r,
+        Err(_) => return (String::new(), false),
+    };
+    let mut writer = match pair.master.take_writer() {
+        Ok(w) => w,
+        Err(_) => return (String::new(), false),
+    };
+    let mut builder = CommandBuilder::new(&argv[0]);
+    builder.args(&argv[1..]);
+    builder.env("TERM", "dumb");
+    if let Some(env) = &env {
+        for (k, v) in env {
+            if v.is_empty() {
+                builder.env_remove(k);
+            } else {
+                builder.env(k, v);
+            }
+        }
+    }
+    let mut child = match pair.slave.spawn_command(builder) {
+        Ok(c) => c,
+        Err(_) => return (String::new(), false),
+    };
+    drop(pair.slave);
+
+    let mut out: Vec<u8> = Vec::new();
+    let mut sent = false;
+    let deadline = Instant::now() + timeout;
+    let mut buf = [0u8; 16384];
+    loop {
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            break;
+        }
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                out.extend_from_slice(&buf[..n]);
+                if !sent {
+                    if let Some(pw) = &password {
+                        if out.windows(7).any(|w| w == b"assword") {
+                            let _ = writer.write_all(pw.as_bytes());
+                            let _ = writer.write_all(b"\r");
+                            let _ = writer.flush();
+                            sent = true;
+                        }
+                    }
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    // Child exited — drain a little more, then finish.
+                    std::thread::sleep(Duration::from_millis(20));
+                    if let Ok(n) = reader.read(&mut buf) {
+                        if n > 0 {
+                            out.extend_from_slice(&buf[..n]);
+                        }
+                    }
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(15));
+            }
+            Err(_) => break,
+        }
+    }
+    let success = child.wait().map(|s| s.success()).unwrap_or(false);
+    (String::from_utf8_lossy(&out).to_string(), success)
+}
 
 pub struct TerminalPane {
     pub parser: vt100_ctt::Parser,
@@ -13,6 +135,27 @@ pub struct TerminalPane {
     pub cols: usize,
     pub rows: usize,
     kill_pid: Option<u32>,
+    /// Password stripped from an `sshpass -p …` wrapper. We type it into the
+    /// pty ourselves on the password prompt, so `sshpass` never has to exist —
+    /// which makes the same command work on Windows (no sshpass there).
+    password: Option<String>,
+    password_sent: bool,
+}
+
+/// Pull the password out of an `sshpass -p PW <cmd…>` prefix, returning the
+/// bare command plus the password. Leaves non-sshpass commands untouched.
+fn strip_sshpass(cmd: Vec<String>) -> (Vec<String>, Option<String>) {
+    if cmd.first().map(|s| s == "sshpass").unwrap_or(false) && cmd.len() >= 2 {
+        // `-p PW <cmd>`
+        if cmd[1] == "-p" && cmd.len() >= 4 {
+            return (cmd[3..].to_vec(), Some(cmd[2].clone()));
+        }
+        // `-pPW <cmd>` (glued)
+        if cmd[1].starts_with("-p") && cmd[1].len() > 2 && cmd.len() >= 3 {
+            return (cmd[2..].to_vec(), Some(cmd[1][2..].to_string()));
+        }
+    }
+    (cmd, None)
 }
 
 impl TerminalPane {
@@ -22,6 +165,7 @@ impl TerminalPane {
         rows: usize,
         env: Option<std::collections::HashMap<String, String>>,
     ) -> Self {
+        let (cmd, password) = strip_sshpass(cmd);
         let mut pane = TerminalPane {
             parser: vt100_ctt::Parser::new(rows as u16, cols as u16, 0),
             acs: AcsFilter::new(),
@@ -32,6 +176,8 @@ impl TerminalPane {
             cols,
             rows,
             kill_pid: None,
+            password,
+            password_sent: false,
         };
         pane.spawn(cmd, env);
         pane
@@ -153,6 +299,18 @@ impl TerminalPane {
                     self.alive = false;
                     break;
                 }
+            }
+        }
+        // Auto-type the sshpass password once, when the ssh password prompt
+        // shows up. Only runs pre-auth (password_sent gates it), and matches
+        // "assword" to cover "Password:" / "password:".
+        if any && !self.password_sent && self.password.is_some() {
+            let prompting = self.parser.screen().contents().contains("assword");
+            if prompting {
+                let pw = self.password.clone().unwrap();
+                self.write_input(pw.as_bytes());
+                self.write_input(b"\r");
+                self.password_sent = true;
             }
         }
         any
