@@ -44,8 +44,10 @@ fn base_url(domain: &str) -> String {
     }
 }
 
-/// Log in and fetch the connect-list for one instance. Blocking; run in a thread.
-pub fn fetch(m: &AppManager) -> FetchResult {
+/// Log in and fetch the connect-list for one instance. Blocking; run in a
+/// thread. If `pubkey` is set, it's registered with the instance (best-effort)
+/// so containers can authorize keyless access.
+pub fn fetch(m: &AppManager, pubkey: Option<&str>) -> FetchResult {
     let mut result = FetchResult {
         domain: m.domain.clone(),
         instance_name: m.name.clone().unwrap_or_else(|| m.domain.clone()),
@@ -92,6 +94,15 @@ pub fn fetch(m: &AppManager) -> FetchResult {
     };
 
     let auth = format!("Bearer {token}");
+
+    // Register our public key so containers can authorize keyless access.
+    // Best-effort: ignored if the instance doesn't have the endpoint yet.
+    if let Some(pk) = pubkey {
+        let _ = agent
+            .post(&format!("{base}/api/keys"))
+            .set("Authorization", &auth)
+            .send_json(ureq::json!({ "public_key": pk }));
+    }
 
     // 2. connect-list — the narrow stable endpoint. Older instances (e.g. a
     // dev deployment behind prod) don't have it and 404/422 the path; in that
@@ -331,7 +342,7 @@ pub struct SyncSummary {
 /// Blocking full sync: fetch every manager, reconcile, write the file. Used by
 /// the `--sync-apps` CLI and reusable for a background refresh.
 pub fn sync_blocking(path: &Path, cfg: &Config) -> SyncSummary {
-    let results: Vec<FetchResult> = cfg.app_managers.iter().map(fetch).collect();
+    let results: Vec<FetchResult> = cfg.app_managers.iter().map(|m| fetch(m, None)).collect();
     let auto = reconcile(&cfg.hosts, &results);
     let mut lines = Vec::new();
     for r in &results {

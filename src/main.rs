@@ -9,6 +9,7 @@ mod progresslog;
 mod restore;
 mod snapshot;
 mod ssh;
+mod sshkey;
 mod terminal;
 
 use std::path::PathBuf;

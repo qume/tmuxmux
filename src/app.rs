@@ -158,6 +158,9 @@ pub struct App {
     app_sync_tx: mpsc::Sender<Vec<Host>>,
     app_sync_rx: mpsc::Receiver<Vec<Host>>,
     app_sync_in_flight: bool,
+    /// Our SSH public key line, registered with each app-manager so containers
+    /// can authorize keyless access. None if we couldn't set one up.
+    ssh_pubkey: Option<String>,
     /// Collapsed sidebar groups: "mgr:<domain>" and "cat:<domain>/<category>".
     collapsed_groups: HashSet<String>,
 
@@ -253,6 +256,17 @@ impl App {
         let (log_tx, log_rx) = mpsc::channel();
         let (app_sync_tx, app_sync_rx) = mpsc::channel();
 
+        // Seamless key setup — only bother if there are app-managers to
+        // register with, so we never touch ~/.ssh for users who don't use them.
+        let (ssh_pubkey, key_generated) = if config.app_managers.is_empty() {
+            (None, false)
+        } else {
+            match crate::sshkey::ensure_public_key() {
+                Some((pk, gen)) => (Some(pk), gen),
+                None => (None, false),
+            }
+        };
+
         let log_cfg = config.log.clone().unwrap_or_default();
 
         let mut app = App {
@@ -274,6 +288,7 @@ impl App {
             app_sync_tx,
             app_sync_rx,
             app_sync_in_flight: false,
+            ssh_pubkey,
             collapsed_groups: HashSet::new(),
             log_tx,
             log_rx,
@@ -295,6 +310,9 @@ impl App {
             status: "loading sessions...".into(),
             font_size: 14.0,
         };
+        if key_generated {
+            app.status = "generated a new SSH key in ~/.ssh for key-based access".into();
+        }
         app.poll_now();
         app.spawn_app_sync();
         app
@@ -314,8 +332,12 @@ impl App {
         let prev_hosts = self.config.hosts.clone();
         let path = self.config_path.clone();
         let tx = self.app_sync_tx.clone();
+        let pubkey = self.ssh_pubkey.clone();
         thread::spawn(move || {
-            let results: Vec<_> = managers.iter().map(appmanager::fetch).collect();
+            let results: Vec<_> = managers
+                .iter()
+                .map(|m| appmanager::fetch(m, pubkey.as_deref()))
+                .collect();
             let auto = appmanager::reconcile(&prev_hosts, &results);
             if let Err(e) = appmanager::write_back(&path, &auto) {
                 log::error!("app-manager write-back failed: {e}");
