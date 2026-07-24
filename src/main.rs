@@ -145,6 +145,8 @@ struct MainApp {
     script_idx: usize,
     script_wait_until: Instant,
     pending_shot: bool,
+    /// Last frame with terminal activity — drives activity-based repaint pacing.
+    last_active: Instant,
 }
 
 #[allow(deprecated)]
@@ -153,7 +155,17 @@ impl eframe::App for MainApp {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.inner.check_results();
-        self.inner.read_all_panes();
+        let had_output = self.inner.read_all_panes();
+
+        // Activity-based pacing: the terminal only needs a fast repaint when
+        // something actually changed — PTY output, input, or a drag. Otherwise
+        // we'd repaint the whole terminal at 60fps forever (~50% CPU on idle).
+        // Any activity opens a short "lively" window; when it lapses we drop to
+        // a slow heartbeat that still catches new output within ~250ms.
+        let had_input = ctx.input(|i| !i.events.is_empty() || i.pointer.any_down());
+        if had_output || had_input {
+            self.last_active = Instant::now();
+        }
 
         // Save any screenshots delivered by the backend.
         let shots: Vec<(egui::UserData, std::sync::Arc<egui::ColorImage>)> = ctx.input(|i| {
@@ -228,14 +240,12 @@ impl eframe::App for MainApp {
 
         self.inner.render_modal(ctx);
 
-        // Steady repaint while a terminal is attached, a log pane is polling,
-        // or a script is driving.
+        // Fast repaints only while lively (recent output/input) or a script is
+        // driving; otherwise a slow heartbeat that still polls the PTY and
+        // drains snapshot/log/app-sync channels within ~250ms.
         let scripting = self.script_idx < self.script.len() || self.pending_shot;
-        if self.inner.focus == app::Focus::Terminal || self.inner.has_log() || scripting {
-            ctx.request_repaint_after(Duration::from_millis(16));
-        } else {
-            ctx.request_repaint_after(Duration::from_millis(200));
-        }
+        let lively = scripting || self.last_active.elapsed() < Duration::from_millis(400);
+        ctx.request_repaint_after(Duration::from_millis(if lively { 16 } else { 500 }));
     }
 }
 
@@ -644,6 +654,7 @@ fn main() {
                 script_idx: 0,
                 script_wait_until: Instant::now(),
                 pending_shot: false,
+                last_active: Instant::now(),
             }))
         }),
     ) {
