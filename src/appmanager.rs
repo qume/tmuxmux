@@ -293,6 +293,51 @@ fn render_host(h: &Host) -> String {
     s
 }
 
+/// Render a minimal hand-written `[[hosts]]` block (name + optional username /
+/// command / local). Used when adding a host from inside the app.
+fn render_hand_host(h: &Host) -> String {
+    let mut s = String::from("[[hosts]]\n");
+    s += &format!("name = {}\n", toml_str(&h.name));
+    if h.local {
+        s += "local = true\n";
+    }
+    if let Some(u) = &h.username {
+        if !u.is_empty() {
+            s += &format!("username = {}\n", toml_str(u));
+        }
+    }
+    if let Some(c) = &h.command {
+        if !c.is_empty() {
+            s += &format!("command = {}\n", toml_str(c));
+        }
+    }
+    s
+}
+
+/// Add a hand-written host to hosts.toml, inserting its `[[hosts]]` block into
+/// the top (verbatim) section just before the app-manager marker — or at the
+/// end if there's no marker yet. The app-manager auto section is preserved.
+pub fn insert_hand_host(path: &Path, host: &Host) -> std::io::Result<()> {
+    let raw = std::fs::read_to_string(path).unwrap_or_default();
+    let block = render_hand_host(host);
+    let out = match raw.find(MARKER) {
+        Some(i) => {
+            let prefix = raw[..i].trim_end();
+            let suffix = &raw[i..];
+            format!("{prefix}\n\n{}\n\n{suffix}", block.trim_end())
+        }
+        None => {
+            let base = raw.trim_end();
+            if base.is_empty() {
+                block
+            } else {
+                format!("{base}\n\n{}", block.trim_end())
+            }
+        }
+    };
+    std::fs::write(path, out)
+}
+
 /// Rewrite hosts.toml: keep everything above the marker verbatim (hand-written
 /// hosts, app_managers, comments), regenerate the auto section below it.
 pub fn write_back(path: &Path, auto_hosts: &[Host]) -> std::io::Result<()> {
@@ -378,5 +423,60 @@ pub fn sync_blocking(path: &Path, cfg: &Config) -> SyncSummary {
     SyncSummary {
         lines,
         auto_hosts: auto,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn h(name: &str, user: Option<&str>) -> Host {
+        Host {
+            name: name.into(),
+            username: user.map(|s| s.into()),
+            command: None,
+            local: false,
+            env: None,
+            manager: None,
+            category: None,
+            status: None,
+            closed: false,
+        }
+    }
+
+    #[test]
+    fn insert_hand_host_preserves_marker_and_auto() {
+        let path = std::env::temp_dir().join(format!("tmuxmux-hosts-{}.toml", std::process::id()));
+        let initial = format!(
+            "[[hosts]]\nname = \"alpha\"\n\n[[app_managers]]\nname = \"x\"\ndomain = \"d\"\nusername = \"u\"\npassword = \"p\"\n\n{MARKER}\n\n# --- d ---\n[[hosts]]\nname = \"auto1\"\nmanager = \"d\"\ncategory = \"mine\"\nclosed = false\n"
+        );
+        std::fs::write(&path, &initial).unwrap();
+
+        insert_hand_host(&path, &h("bots", Some("gc"))).unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+
+        // New host landed ABOVE the marker (in the hand-written zone).
+        let mi = out.find(MARKER).unwrap();
+        assert!(out[..mi].contains("name = \"bots\""), "bots not above marker:\n{out}");
+        assert!(out[..mi].contains("username = \"gc\""));
+        // Auto section (below marker) is preserved.
+        assert!(out[mi..].contains("name = \"auto1\""));
+        // Result is still valid TOML with all three hosts + the app_manager.
+        let val: toml::Value = toml::from_str(&out).unwrap();
+        assert_eq!(val["hosts"].as_array().unwrap().len(), 3);
+        assert_eq!(val["app_managers"].as_array().unwrap().len(), 1);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn insert_hand_host_no_marker_appends() {
+        let path = std::env::temp_dir().join(format!("tmuxmux-nomark-{}.toml", std::process::id()));
+        std::fs::write(&path, "[[hosts]]\nname = \"alpha\"\n").unwrap();
+        insert_hand_host(&path, &h("bots", None)).unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+        let val: toml::Value = toml::from_str(&out).unwrap();
+        assert_eq!(val["hosts"].as_array().unwrap().len(), 2);
+        std::fs::remove_file(&path).ok();
     }
 }

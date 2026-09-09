@@ -87,6 +87,12 @@ impl Db {
                 name TEXT NOT NULL,
                 hidden_at INTEGER,
                 UNIQUE(host, name)
+            );
+            CREATE TABLE IF NOT EXISTS favourite_sessions (
+                host TEXT NOT NULL,
+                name TEXT NOT NULL,
+                added_at INTEGER,
+                UNIQUE(host, name)
             );",
         )?;
         Ok(Db { conn })
@@ -270,6 +276,39 @@ impl Db {
             Err(_) => return vec![],
         };
         stmt.query_map(params![host], |r| r.get(0))
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Mark (host, name) as a favourite. Keyed by (host, name) so it survives
+    /// restarts; drives the pinned "★ favourites" group.
+    pub fn favourite_session(&self, host: &str, name: &str) {
+        let _ = self.conn.execute(
+            "INSERT INTO favourite_sessions (host, name, added_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(host, name) DO UPDATE SET added_at = excluded.added_at",
+            params![host, name, now_epoch()],
+        );
+    }
+
+    /// Undo `favourite_session`.
+    pub fn unfavourite_session(&self, host: &str, name: &str) {
+        let _ = self.conn.execute(
+            "DELETE FROM favourite_sessions WHERE host = ?1 AND name = ?2",
+            params![host, name],
+        );
+    }
+
+    /// All favourites as (host, name), oldest-added first — the display order
+    /// of the favourites group.
+    pub fn favourites(&self) -> Vec<(String, String)> {
+        let mut stmt = match self
+            .conn
+            .prepare("SELECT host, name FROM favourite_sessions ORDER BY added_at, host, name")
+        {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
             .map(|rows| rows.filter_map(|r| r.ok()).collect())
             .unwrap_or_default()
     }

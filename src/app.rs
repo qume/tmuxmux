@@ -59,6 +59,10 @@ pub struct HostEntry {
 /// instance (extra indent).
 #[derive(Clone)]
 enum Row {
+    /// "★ favourites (N)" header for the pinned group at the very top.
+    FavHeader(usize),
+    /// One favourited session in that group: (host name, session name).
+    Fav(String, String),
     Host(usize, bool),
     Session(usize, usize, bool),
     /// The "+ new" row at the end of a host's session list.
@@ -94,6 +98,13 @@ pub enum AppModal {
     RestoreAll {
         host_idx: usize,
         names: Vec<String>,
+    },
+    /// Add a hand-written host, written into hosts.toml.
+    AddHost {
+        name: String,
+        username: String,
+        command: String,
+        just_opened: bool,
     },
 }
 
@@ -179,6 +190,11 @@ pub struct App {
     last_log_fetch: Instant,
 
     tree_cursor: usize,
+    /// Live text in the sidebar filter box; empty = no filtering.
+    filter: String,
+    /// Favourited sessions as (host, session name), oldest-first. Persisted in
+    /// the DB; mirrored into the pinned "★ favourites" group at the top.
+    favourites: Vec<(String, String)>,
 
     pub selection: Option<Selection>,
     selecting: bool,
@@ -269,6 +285,8 @@ impl App {
 
         let log_cfg = config.log.clone().unwrap_or_default();
 
+        let favourites = db.as_ref().map(|d| d.favourites()).unwrap_or_default();
+
         let mut app = App {
             config,
             hosts,
@@ -302,6 +320,8 @@ impl App {
             log_hidden: false,
             last_log_fetch: Instant::now(),
             tree_cursor: 0,
+            filter: String::new(),
+            favourites,
             selection: None,
             selecting: false,
             clipboard,
@@ -831,7 +851,86 @@ impl App {
             AppModal::RestoreAll { host_idx, names } => {
                 self.restore_sessions(host_idx, names, false);
             }
+            AppModal::AddHost {
+                name,
+                username,
+                command,
+                ..
+            } => {
+                let name = name.trim().to_string();
+                if name.is_empty() {
+                    self.status = "host name empty — cancelled".into();
+                    return;
+                }
+                if self.config.hosts.iter().any(|h| h.name == name) {
+                    self.status = format!("host '{name}' already exists");
+                    return;
+                }
+                let opt = |s: &str| {
+                    let s = s.trim();
+                    if s.is_empty() {
+                        None
+                    } else {
+                        Some(s.to_string())
+                    }
+                };
+                let host = Host {
+                    name,
+                    username: opt(&username),
+                    command: opt(&command),
+                    local: false,
+                    env: None,
+                    manager: None,
+                    category: None,
+                    status: None,
+                    closed: false,
+                };
+                self.add_hand_host(host);
+            }
         }
+    }
+
+    /// Persist a new hand-written host to hosts.toml and show it live.
+    fn add_hand_host(&mut self, host: Host) {
+        if let Err(e) = appmanager::insert_hand_host(&self.config_path, &host) {
+            self.status = format!("failed to write hosts.toml: {e}");
+            return;
+        }
+        let name = host.name.clone();
+        let closed = self
+            .db
+            .as_ref()
+            .map(|d| d.closed_sessions(&host.name))
+            .unwrap_or_default();
+        let hidden_set = self
+            .db
+            .as_ref()
+            .map(|d| d.hidden_for_host(&host.name).into_iter().collect())
+            .unwrap_or_default();
+        self.config.hosts.push(host.clone());
+        self.hosts.push(HostEntry {
+            closed,
+            hidden_set,
+            hidden: Vec::new(),
+            hidden_expanded: false,
+            expanded: true,
+            host,
+            sessions: Vec::new(),
+            closed_expanded: false,
+            loaded: false,
+            error: None,
+        });
+        self.status = format!("added host {name}");
+        self.poll_now();
+    }
+
+    pub fn open_add_host_modal(&mut self) {
+        self.modal = Some(AppModal::AddHost {
+            name: String::new(),
+            username: String::new(),
+            command: String::new(),
+            just_opened: true,
+        });
     }
 
     /// Recreate cached sessions on their host in a background thread.
@@ -893,6 +992,44 @@ impl App {
     /// untouched; this only records a client-side view preference (persisted)
     /// and moves the row into the "⊘ hidden" group. We update the in-memory
     /// lists immediately so the row disappears without waiting for a poll.
+    pub fn is_favourite(&self, host: &str, name: &str) -> bool {
+        self.favourites
+            .iter()
+            .any(|(h, n)| h == host && n == name)
+    }
+
+    /// Star/unstar a session. Persisted in the DB and mirrored into the pinned
+    /// "★ favourites" group.
+    pub fn toggle_favourite(&mut self, host: &str, name: &str) {
+        if let Some(pos) = self
+            .favourites
+            .iter()
+            .position(|(h, n)| h == host && n == name)
+        {
+            self.favourites.remove(pos);
+            if let Some(db) = self.db.as_ref() {
+                db.unfavourite_session(host, name);
+            }
+            self.status = format!("unstarred {host}/{name}");
+        } else {
+            self.favourites.push((host.to_string(), name.to_string()));
+            if let Some(db) = self.db.as_ref() {
+                db.favourite_session(host, name);
+            }
+            self.status = format!("starred {host}/{name}");
+        }
+    }
+
+    /// True if a session is currently live on its host (used to dim favourites
+    /// whose session isn't present in the latest snapshot).
+    fn session_is_live(&self, host: &str, name: &str) -> bool {
+        self.hosts
+            .iter()
+            .find(|e| e.host.name == host)
+            .map(|e| e.sessions.iter().any(|s| s.name == name))
+            .unwrap_or(false)
+    }
+
     pub fn hide_session(&mut self, host_idx: usize, name: &str) {
         let host_name = self.hosts[host_idx].host.name.clone();
         if let Some(db) = self.db.as_ref() {
@@ -1077,6 +1214,11 @@ impl App {
         if self.modal.is_some() {
             return false;
         }
+        // If a text widget (the sidebar filter) has keyboard focus, let egui
+        // consume typing rather than forwarding it to the tree or terminal.
+        if ctx.wants_keyboard_input() {
+            return false;
+        }
         let (events, modifiers) = ctx.input(|i| (i.events.clone(), i.modifiers));
         let mut quit = false;
 
@@ -1236,8 +1378,35 @@ impl App {
         quit
     }
 
+    /// A session passes the filter when the filter is empty, or its name or its
+    /// host's name contains the (lower-cased) filter text.
+    fn session_matches_filter(&self, host: &str, session: &str) -> bool {
+        if self.filter.is_empty() {
+            return true;
+        }
+        let f = self.filter.to_lowercase();
+        session.to_lowercase().contains(&f) || host.to_lowercase().contains(&f)
+    }
+
     fn visible_rows(&self) -> Vec<Row> {
         let mut rows = Vec::new();
+
+        // 0. Pinned favourites group at the very top (spans all hosts).
+        let favs: Vec<(String, String)> = self
+            .favourites
+            .iter()
+            .filter(|(h, n)| self.session_matches_filter(h, n))
+            .cloned()
+            .collect();
+        if !favs.is_empty() {
+            rows.push(Row::FavHeader(favs.len()));
+            if !self.collapsed_groups.contains("fav") {
+                for (h, n) in favs {
+                    rows.push(Row::Fav(h, n));
+                }
+            }
+        }
+
         // 1. Hand-written hosts (no manager) at the top, flat.
         for (hi, entry) in self.hosts.iter().enumerate() {
             if entry.host.manager.is_none() {
@@ -1253,38 +1422,76 @@ impl App {
                 }
             }
         }
+        // While filtering, ignore collapse state and drop empty headers so
+        // matches buried in collapsed groups still surface.
+        let filtering = !self.filter.is_empty();
         for m in &managers {
-            rows.push(Row::ManagerHeader(m.clone()));
-            if self.collapsed_groups.contains(&format!("mgr:{m}")) {
+            // Build this manager's rows into a buffer first; only emit the
+            // header if it has content (matters while filtering).
+            let mut mgr_rows: Vec<Row> = Vec::new();
+            let collapsed_mgr = !filtering && self.collapsed_groups.contains(&format!("mgr:{m}"));
+            if !collapsed_mgr {
+                for cat in ["mine", "shared", "public"] {
+                    let cat_hosts: Vec<usize> = self
+                        .hosts
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, e)| {
+                            e.host.manager.as_deref() == Some(m.as_str())
+                                && e.host.category.as_deref() == Some(cat)
+                        })
+                        .map(|(hi, _)| hi)
+                        .collect();
+                    if cat_hosts.is_empty() {
+                        continue;
+                    }
+                    let mut cat_rows: Vec<Row> = Vec::new();
+                    let collapsed_cat =
+                        !filtering && self.collapsed_groups.contains(&format!("cat:{m}/{cat}"));
+                    if !collapsed_cat {
+                        for hi in cat_hosts.iter().copied() {
+                            self.emit_host_rows(hi, &self.hosts[hi], true, &mut cat_rows);
+                        }
+                    }
+                    // While filtering, skip a category that produced no rows.
+                    if filtering && cat_rows.is_empty() {
+                        continue;
+                    }
+                    mgr_rows.push(Row::CategoryHeader(m.clone(), cat.to_string(), cat_hosts.len()));
+                    mgr_rows.append(&mut cat_rows);
+                }
+            }
+            if filtering && mgr_rows.is_empty() {
                 continue;
             }
-            for cat in ["mine", "shared", "public"] {
-                let cat_hosts: Vec<usize> = self
-                    .hosts
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, e)| {
-                        e.host.manager.as_deref() == Some(m.as_str())
-                            && e.host.category.as_deref() == Some(cat)
-                    })
-                    .map(|(hi, _)| hi)
-                    .collect();
-                if cat_hosts.is_empty() {
-                    continue;
-                }
-                rows.push(Row::CategoryHeader(m.clone(), cat.to_string(), cat_hosts.len()));
-                if self.collapsed_groups.contains(&format!("cat:{m}/{cat}")) {
-                    continue;
-                }
-                for hi in cat_hosts {
-                    self.emit_host_rows(hi, &self.hosts[hi], true, &mut rows);
-                }
-            }
+            rows.push(Row::ManagerHeader(m.clone()));
+            rows.append(&mut mgr_rows);
         }
         rows
     }
 
     fn emit_host_rows(&self, hi: usize, entry: &HostEntry, grouped: bool, rows: &mut Vec<Row>) {
+        // While filtering, show only matching sessions (force-expanded) and
+        // drop the +new / closed / hidden auxiliary rows. A host appears if its
+        // name matches or it has at least one matching session.
+        if !self.filter.is_empty() {
+            let host = &entry.host.name;
+            let match_idxs: Vec<usize> = (0..entry.sessions.len())
+                .filter(|&si| self.session_matches_filter(host, &entry.sessions[si].name))
+                .collect();
+            let host_matches = host
+                .to_lowercase()
+                .contains(&self.filter.to_lowercase());
+            if match_idxs.is_empty() && !host_matches {
+                return;
+            }
+            rows.push(Row::Host(hi, grouped));
+            for si in match_idxs {
+                rows.push(Row::Session(hi, si, grouped));
+            }
+            return;
+        }
+
         rows.push(Row::Host(hi, grouped));
         if entry.expanded {
             for si in 0..entry.sessions.len() {
@@ -1344,13 +1551,19 @@ impl App {
                 Row::CategoryHeader(m, c, _) => {
                     self.collapsed_groups.insert(format!("cat:{m}/{c}"));
                 }
-                Row::Session(..) => {}
+                Row::FavHeader(_) => {
+                    self.collapsed_groups.insert("fav".to_string());
+                }
+                Row::Session(..) | Row::Fav(..) => {}
             },
             egui::Key::ArrowRight => match rows[self.tree_cursor].clone() {
                 Row::Host(hi, _) => {
                     if !self.hosts[hi].expanded {
                         self.toggle_host_expanded(hi);
                     }
+                }
+                Row::FavHeader(_) => {
+                    self.collapsed_groups.remove("fav");
                 }
                 Row::ClosedToggle(hi, _) => self.hosts[hi].closed_expanded = true,
                 Row::HiddenToggle(hi, _) => self.hosts[hi].hidden_expanded = true,
@@ -1397,6 +1610,12 @@ impl App {
                 Row::CategoryHeader(m, c, _) => {
                     self.toggle_group(&format!("cat:{m}/{c}"));
                 }
+                Row::FavHeader(_) => {
+                    self.toggle_group("fav");
+                }
+                Row::Fav(h, n) => {
+                    self.activate_session(&h, &n);
+                }
             },
             // Delete hides the live session under the cursor (unbound key, no
             // conflict with the vim-style j/k/arrows). Unhide from the group.
@@ -1429,9 +1648,34 @@ impl App {
 
     pub fn render_sidebar(&mut self, ui: &mut Ui) {
         ui.add_space(4.0);
+        let mut add_host_req = false;
         ui.horizontal(|ui| {
             ui.add_space(6.0);
             ui.colored_label(Color32::from_gray(200), egui::RichText::new("sessions").strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(6.0);
+                if ui.small_button("+ host").on_hover_text("add a host to hosts.toml").clicked() {
+                    add_host_req = true;
+                }
+            });
+        });
+        if add_host_req {
+            self.open_add_host_modal();
+        }
+        // Filter box: typing narrows the tree to matching sessions (and their
+        // hosts). A × clears it. Focus is detected in handle_events so keys go
+        // here rather than to the tree/terminal while typing.
+        ui.horizontal(|ui| {
+            ui.add_space(6.0);
+            let clear_w = if self.filter.is_empty() { 0.0 } else { 22.0 };
+            ui.add(
+                egui::TextEdit::singleline(&mut self.filter)
+                    .desired_width(ui.available_width() - clear_w - 6.0)
+                    .hint_text("filter…"),
+            );
+            if !self.filter.is_empty() && ui.small_button("×").clicked() {
+                self.filter.clear();
+            }
         });
         ui.separator();
 
@@ -1446,6 +1690,7 @@ impl App {
         let mut hide_one: Option<(usize, String)> = None;
         let mut unhide_one: Option<(usize, String)> = None;
         let mut toggle_hidden: Option<usize> = None;
+        let mut toggle_fav: Option<(String, String)> = None;
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             for (i, row) in rows.iter().enumerate() {
@@ -1454,6 +1699,31 @@ impl App {
                 // deeper than the equivalent hand-written-host rows.
                 let g = |base: f32, grouped: bool| base + if grouped { 18.0 } else { 0.0 };
                 let (label, hint, indent, color, is_active) = match row {
+                    Row::FavHeader(n) => {
+                        let collapsed = self.collapsed_groups.contains("fav");
+                        let arrow = if collapsed { "▸" } else { "▾" };
+                        (
+                            format!("{arrow} ★ favourites ({n})"),
+                            None,
+                            6.0,
+                            Color32::from_rgb(240, 200, 90),
+                            false,
+                        )
+                    }
+                    Row::Fav(h, n) => {
+                        let key = format!("{h}/{n}");
+                        let active = self.active_key.as_deref() == Some(key.as_str());
+                        let live = self.session_is_live(h, n);
+                        let color = if active {
+                            Color32::from_rgb(140, 235, 140)
+                        } else if live {
+                            Color32::from_gray(220)
+                        } else {
+                            // Favourite whose session isn't currently live.
+                            Color32::from_gray(120)
+                        };
+                        (format!("★ {n}"), Some(h.clone()), 24.0, color, active)
+                    }
                     Row::ManagerHeader(m) => {
                         let collapsed = self.collapsed_groups.contains(&format!("mgr:{m}"));
                         let arrow = if collapsed { "▸" } else { "▾" };
@@ -1677,9 +1947,59 @@ impl App {
                     }
                 }
 
+                // Star: a filled ★ is always shown for favourites; a hollow ☆
+                // appears on hover otherwise. On a session row it sits left of
+                // the × (right−30); on a favourite row at the right edge
+                // (right−12). Painted only — the click is dispatched by pointer
+                // x below, because a separate hit-widget overlapping the row
+                // loses the click to the row.
+                let star_hn: Option<(String, String)> = match row {
+                    Row::Session(hi, si, _) => {
+                        let e = &self.hosts[*hi];
+                        Some((e.host.name.clone(), e.sessions[*si].name.clone()))
+                    }
+                    Row::Fav(h, n) => Some((h.clone(), n.clone())),
+                    _ => None,
+                };
+                let mut star_zone: Option<(f32, f32)> = None;
+                if let Some((h, n)) = &star_hn {
+                    let fav = self.is_favourite(h, n);
+                    if fav || response.hovered() {
+                        let sx = if matches!(row, Row::Fav(..)) {
+                            rect.right() - 12.0
+                        } else {
+                            rect.right() - 30.0
+                        };
+                        let (glyph, col) = if fav {
+                            ("★", Color32::from_rgb(240, 200, 90))
+                        } else {
+                            ("☆", Color32::from_gray(120))
+                        };
+                        ui.painter().text(
+                            egui::pos2(sx, rect.center().y),
+                            egui::Align2::CENTER_CENTER,
+                            glyph,
+                            FontId::monospace(14.0),
+                            col,
+                        );
+                        star_zone = Some((sx - 9.0, sx + 9.0));
+                    }
+                }
+                let clicked_star = star_zone
+                    .zip(response.interact_pointer_pos())
+                    .map(|((lo, hi), p)| p.x >= lo && p.x <= hi)
+                    .unwrap_or(false);
+
                 if response.clicked() && !hide_clicked {
                     self.tree_cursor = i;
+                    if clicked_star {
+                        if let Some((h, n)) = &star_hn {
+                            toggle_fav = Some((h.clone(), n.clone()));
+                        }
+                    } else {
                     match row {
+                        Row::FavHeader(_) => toggle_group = Some("fav".to_string()),
+                        Row::Fav(h, n) => pending = Some((h.clone(), n.clone())),
                         Row::Host(hi, _) => toggle = Some(*hi),
                         Row::Session(hi, si, _) => {
                             let e = &self.hosts[*hi];
@@ -1702,6 +2022,7 @@ impl App {
                         Row::CategoryHeader(m, c, _) => {
                             toggle_group = Some(format!("cat:{m}/{c}"))
                         }
+                    }
                     }
                 }
             }
@@ -1737,6 +2058,9 @@ impl App {
         if let Some((hi, name)) = unhide_one {
             self.unhide_session(hi, &name);
         }
+        if let Some((h, n)) = toggle_fav {
+            self.toggle_favourite(&h, &n);
+        }
     }
 
     /// Whichever dialog is open. Rendered last so it sits on top.
@@ -1748,8 +2072,14 @@ impl App {
             AppModal::NewSession { host_idx, .. }
             | AppModal::Restore { host_idx, .. }
             | AppModal::RestoreAll { host_idx, .. } => *host_idx,
+            AppModal::AddHost { .. } => usize::MAX,
         };
-        let host_name = self.hosts[host_idx].host.name.clone();
+        // AddHost has no associated host; guard the lookup.
+        let host_name = self
+            .hosts
+            .get(host_idx)
+            .map(|e| e.host.name.clone())
+            .unwrap_or_default();
         let mut accept = false;
         let mut cancel = false;
         let mut forget: Option<String> = None;
@@ -1844,6 +2174,59 @@ impl App {
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
                         if ui.button(format!("restore all {}", names.len())).clicked() {
+                            accept = true;
+                        }
+                        if ui.button("cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                }
+                AppModal::AddHost {
+                    name,
+                    username,
+                    command,
+                    just_opened,
+                } => {
+                    ui.heading("add host");
+                    ui.add_space(4.0);
+                    ui.colored_label(
+                        Color32::from_gray(150),
+                        "written to hosts.toml. Name is an ssh target (alias, host,\nor IP). Command is optional (custom login invocation).",
+                    );
+                    ui.add_space(8.0);
+                    egui::Grid::new("add_host_form")
+                        .num_columns(2)
+                        .spacing([8.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label("name");
+                            let edit = ui.add(
+                                egui::TextEdit::singleline(name)
+                                    .hint_text("bots")
+                                    .desired_width(f32::INFINITY),
+                            );
+                            if *just_opened {
+                                *just_opened = false;
+                                edit.request_focus();
+                            }
+                            ui.end_row();
+                            ui.label("username");
+                            ui.add(
+                                egui::TextEdit::singleline(username)
+                                    .hint_text("optional, e.g. gc")
+                                    .desired_width(f32::INFINITY),
+                            );
+                            ui.end_row();
+                            ui.label("command");
+                            ui.add(
+                                egui::TextEdit::singleline(command)
+                                    .hint_text("optional custom ssh command")
+                                    .desired_width(f32::INFINITY),
+                            );
+                            ui.end_row();
+                        });
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("add").clicked() {
                             accept = true;
                         }
                         if ui.button("cancel").clicked() {
