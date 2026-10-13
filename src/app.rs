@@ -1214,23 +1214,15 @@ impl App {
         if self.modal.is_some() {
             return false;
         }
-        // If a text widget (the sidebar filter) has keyboard focus, let egui
-        // consume typing rather than forwarding it to the tree or terminal.
-        if ctx.wants_keyboard_input() {
+        // If a sidebar text widget (the filter box) has keyboard focus, let
+        // egui consume typing rather than forwarding it. The terminal surface
+        // also holds egui focus (so it keeps Tab/arrows/Escape), so exclude it
+        // from this check — otherwise we'd stop forwarding terminal input.
+        let term_id = egui::Id::new("tmuxmux_terminal");
+        if ctx.wants_keyboard_input() && ctx.memory(|m| m.focused()) != Some(term_id) {
             return false;
         }
         let (events, modifiers) = ctx.input(|i| (i.events.clone(), i.modifiers));
-
-        // Terminals use Tab constantly, but egui treats Tab as focus-navigation
-        // and would jump to a sidebar widget (the + host button). We've cloned
-        // the events for forwarding; now strip Tab from egui's own queue so it
-        // never steals it. (Only reached when no text field is focused — the
-        // guards above return early otherwise.)
-        ctx.input_mut(|i| {
-            i.events
-                .retain(|e| !matches!(e, egui::Event::Key { key: egui::Key::Tab, .. }));
-        });
-
         let mut quit = false;
 
         for event in &events {
@@ -2314,8 +2306,13 @@ impl App {
         };
 
         // Mouse interaction (selection or forwarding) before painting so a
-        // drag this frame highlights this frame.
-        let response = ui.allocate_rect(avail, Sense::click_and_drag());
+        // drag this frame highlights this frame. A stable id lets us hold
+        // egui keyboard focus on the terminal (see the focus block below).
+        let response = ui.interact(
+            avail,
+            egui::Id::new("tmuxmux_terminal"),
+            Sense::click_and_drag(),
+        );
         if alive {
             self.handle_terminal_mouse(ui, &response, inner.min, glyph_w, line_h, cols, rows);
         }
@@ -2480,6 +2477,30 @@ impl App {
 
         if response.clicked() && self.focus != Focus::Terminal {
             self.focus = Focus::Terminal;
+        }
+
+        // Hold egui keyboard focus on the terminal while it's the active pane
+        // and declare that it wants Tab / arrows / Escape, so egui doesn't
+        // treat those as focus-navigation (which jumped to the + host button).
+        // egui decides focus movement in begin_pass before our code runs, so
+        // suppressing it afterwards is impossible — this filter is the only
+        // hook. Don't steal focus from the filter box or an open dialog.
+        if self.focus == Focus::Terminal && self.modal.is_none() {
+            let cur = ui.memory(|m| m.focused());
+            if cur.is_none() || cur == Some(response.id) {
+                response.request_focus();
+                ui.memory_mut(|m| {
+                    m.set_focus_lock_filter(
+                        response.id,
+                        egui::EventFilter {
+                            tab: true,
+                            horizontal_arrows: true,
+                            vertical_arrows: true,
+                            escape: true,
+                        },
+                    );
+                });
+            }
         }
     }
 
