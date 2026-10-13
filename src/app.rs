@@ -1220,6 +1220,17 @@ impl App {
             return false;
         }
         let (events, modifiers) = ctx.input(|i| (i.events.clone(), i.modifiers));
+
+        // Terminals use Tab constantly, but egui treats Tab as focus-navigation
+        // and would jump to a sidebar widget (the + host button). We've cloned
+        // the events for forwarding; now strip Tab from egui's own queue so it
+        // never steals it. (Only reached when no text field is focused — the
+        // guards above return early otherwise.)
+        ctx.input_mut(|i| {
+            i.events
+                .retain(|e| !matches!(e, egui::Event::Key { key: egui::Key::Tab, .. }));
+        });
+
         let mut quit = false;
 
         for event in &events {
@@ -1915,35 +1926,21 @@ impl App {
 
                 // A small "×" appears at the right edge of a live session row
                 // on hover; clicking it hides the session (client-side only).
-                // Its own hit-area is interacted separately so the row-click
-                // that would attach is suppressed when the × is pressed.
-                let mut hide_clicked = false;
-                if let Row::Session(hi, si, _) = row {
+                // Painted only (no overlapping hit-widget — that stole hover
+                // from the row and made it flicker); the click is dispatched by
+                // pointer x below, same as the star.
+                let mut x_zone: Option<(f32, f32)> = None;
+                if let Row::Session(..) = row {
                     if response.hovered() {
-                        let center = egui::pos2(rect.right() - 12.0, rect.center().y);
-                        let x_rect = Rect::from_center_size(center, Vec2::splat(16.0));
-                        let x_resp = ui.interact(
-                            x_rect,
-                            ui.make_persistent_id(("hide-x", i)),
-                            Sense::click(),
-                        );
-                        let x_color = if x_resp.hovered() {
-                            Color32::from_rgb(235, 120, 120)
-                        } else {
-                            Color32::from_gray(130)
-                        };
+                        let cx = rect.right() - 12.0;
                         ui.painter().text(
-                            center,
+                            egui::pos2(cx, rect.center().y),
                             egui::Align2::CENTER_CENTER,
                             "×",
                             FontId::monospace(14.0),
-                            x_color,
+                            Color32::from_gray(150),
                         );
-                        if x_resp.clicked() {
-                            hide_one =
-                                Some((*hi, self.hosts[*hi].sessions[*si].name.clone()));
-                            hide_clicked = true;
-                        }
+                        x_zone = Some((cx - 9.0, cx + 9.0));
                     }
                 }
 
@@ -1985,14 +1982,22 @@ impl App {
                         star_zone = Some((sx - 9.0, sx + 9.0));
                     }
                 }
-                let clicked_star = star_zone
-                    .zip(response.interact_pointer_pos())
-                    .map(|((lo, hi), p)| p.x >= lo && p.x <= hi)
-                    .unwrap_or(false);
+                let click_x = response.interact_pointer_pos().map(|p| p.x);
+                let in_zone = |z: Option<(f32, f32)>| {
+                    z.zip(click_x)
+                        .map(|((lo, hi), x)| x >= lo && x <= hi)
+                        .unwrap_or(false)
+                };
+                let clicked_x = in_zone(x_zone);
+                let clicked_star = in_zone(star_zone);
 
-                if response.clicked() && !hide_clicked {
+                if response.clicked() {
                     self.tree_cursor = i;
-                    if clicked_star {
+                    if clicked_x {
+                        if let Row::Session(hi, si, _) = row {
+                            hide_one = Some((*hi, self.hosts[*hi].sessions[*si].name.clone()));
+                        }
+                    } else if clicked_star {
                         if let Some((h, n)) = &star_hn {
                             toggle_fav = Some((h.clone(), n.clone()));
                         }
