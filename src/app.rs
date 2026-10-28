@@ -33,6 +33,9 @@ pub struct SessionInfo {
     pub cwd: Option<String>,
     /// Whether a progress log exists for this session (from the host sweep).
     pub has_log: bool,
+    /// tmux last-activity epoch; compared against our last visit to flag the
+    /// "fresh output" pill. None when unknown (e.g. just created locally).
+    pub activity: Option<i64>,
 }
 
 pub struct HostEntry {
@@ -162,7 +165,6 @@ pub struct App {
     in_flight: HashSet<String>,
     db: Option<Db>,
     poll_interval: Duration,
-    last_poll: Instant,
 
     // App-manager sync (apps discovered from geocam apps-manager instances).
     config_path: PathBuf,
@@ -195,6 +197,12 @@ pub struct App {
     /// Favourited sessions as (host, session name), oldest-first. Persisted in
     /// the DB; mirrored into the pinned "★ favourites" group at the top.
     favourites: Vec<(String, String)>,
+    /// Epoch of when we last viewed each session ("host/name" → epoch). Set on
+    /// attach and kept current while it's the active session. A session is
+    /// "fresh" when tmux activity is newer than this. In-memory (per run).
+    visited: HashMap<String, i64>,
+    /// Per-host Instant of the last snapshot kick, for the adaptive schedule.
+    last_polled: HashMap<String, Instant>,
 
     pub selection: Option<Selection>,
     selecting: bool,
@@ -301,7 +309,6 @@ impl App {
             in_flight: HashSet::new(),
             db,
             poll_interval: Duration::from_secs(interval_secs),
-            last_poll: Instant::now(),
             config_path,
             app_sync_tx,
             app_sync_rx,
@@ -322,6 +329,8 @@ impl App {
             tree_cursor: 0,
             filter: String::new(),
             favourites,
+            visited: HashMap::new(),
+            last_polled: HashMap::new(),
             selection: None,
             selecting: false,
             clipboard,
@@ -431,6 +440,8 @@ impl App {
     /// with dozens of apps doesn't fire dozens of ssh connections on launch or
     /// every poll (which chokes on a flaky connection). Expanding an app
     /// triggers an immediate poll (see `poll_after_expand`).
+    /// Explicit full refresh (launch, F5, expanding a host): snapshot every
+    /// host you're looking at right now, immediately.
     pub fn poll_now(&mut self) {
         let active_host = self
             .active_key
@@ -449,23 +460,90 @@ impl App {
             })
             .map(|e| e.host.clone())
             .collect();
-        for h in &due {
-            self.in_flight.insert(h.name.clone());
+        self.spawn_for(due);
+    }
+
+    /// Adaptive per-host poll interval. Hosts you're looking at (hand-written,
+    /// expanded, or holding the active session) keep the normal cadence;
+    /// otherwise a fall-off watch drives the "fresh" pill — poll 5 min after a
+    /// session was last visited, 30 min once it's an hour old, then stop at
+    /// three hours. None = don't auto-poll this host right now.
+    fn host_poll_interval(&self, entry: &HostEntry, active_host: Option<&str>) -> Option<Duration> {
+        if self.poll_interval.is_zero() {
+            return None;
         }
-        self.last_poll = Instant::now();
+        let visible = entry.host.manager.is_none()
+            || entry.expanded
+            || active_host == Some(entry.host.name.as_str());
+        if visible {
+            return Some(self.poll_interval);
+        }
+        let now = db::now_epoch();
+        let youngest = entry
+            .sessions
+            .iter()
+            .filter_map(|s| self.visited.get(&format!("{}/{}", entry.host.name, s.name)))
+            .map(|v| now - *v)
+            .min();
+        match youngest {
+            Some(age) if age < 3600 => Some(Duration::from_secs(300)),
+            Some(age) if age < 10800 => Some(Duration::from_secs(1800)),
+            _ => None,
+        }
+    }
+
+    /// Snapshot every host whose adaptive interval is due.
+    fn poll_due(&mut self) {
+        let now_inst = Instant::now();
+        let active_host = self
+            .active_key
+            .as_deref()
+            .and_then(|k| k.split_once('/'))
+            .map(|(h, _)| h.to_string());
+        let due: Vec<Host> = self
+            .hosts
+            .iter()
+            .filter(|e| !e.host.closed && !self.in_flight.contains(&e.host.name))
+            .filter(|e| match self.host_poll_interval(e, active_host.as_deref()) {
+                Some(iv) => self
+                    .last_polled
+                    .get(&e.host.name)
+                    .map(|t| now_inst.duration_since(*t) >= iv)
+                    .unwrap_or(true),
+                None => false,
+            })
+            .map(|e| e.host.clone())
+            .collect();
+        self.spawn_for(due);
+    }
+
+    /// Mark the given hosts in-flight, stamp their poll time, and spawn the
+    /// snapshot threads.
+    fn spawn_for(&mut self, hosts: Vec<Host>) {
+        if hosts.is_empty() {
+            return;
+        }
+        let now_inst = Instant::now();
+        for h in &hosts {
+            self.in_flight.insert(h.name.clone());
+            self.last_polled.insert(h.name.clone(), now_inst);
+        }
         let logf = if self.log_enabled {
             Some(self.log_filename.clone())
         } else {
             None
         };
-        spawn_snapshots(due, self.snapshot_tx.clone(), logf);
+        spawn_snapshots(hosts, self.snapshot_tx.clone(), logf);
     }
 
     /// Called every frame: kick scheduled polls, absorb results.
     pub fn check_results(&mut self) {
-        if !self.poll_interval.is_zero() && self.last_poll.elapsed() >= self.poll_interval {
-            self.poll_now();
+        // Keep the active session's visit current so its own output is never
+        // flagged as fresh when you leave it.
+        if let Some(k) = self.active_key.clone() {
+            self.visited.insert(k, db::now_epoch());
         }
+        self.poll_due();
 
         while let Ok(result) = self.snapshot_rx.try_recv() {
             self.apply_snapshot_result(result);
@@ -593,6 +671,7 @@ impl App {
                     hint: session_hint(s),
                     cwd: active_cwd(s),
                     has_log: s.has_log,
+                    activity: s.activity,
                 })
                 .collect();
             entry.hidden = result
@@ -633,6 +712,7 @@ impl App {
                     hint: None,
                     cwd: None,
                     has_log: false,
+                    activity: None,
                 });
             }
             entry.closed.retain(|c| c.name != result.session_name);
@@ -699,6 +779,10 @@ impl App {
                 return;
             }
         };
+        // Mark visited now so its own output doesn't read as "fresh", and so
+        // the host enters the frequent end of the fall-off watch schedule.
+        self.visited
+            .insert(format!("{host_name}/{session_name}"), db::now_epoch());
         let cmd = build_attach_command(&host, session_name);
         self.open_pane(&host, session_name, cmd);
     }
@@ -840,6 +924,7 @@ impl App {
                         hint: None,
                         cwd: None,
                         has_log: false,
+                        activity: None,
                     });
                 }
             }
@@ -992,6 +1077,21 @@ impl App {
     /// untouched; this only records a client-side view preference (persisted)
     /// and moves the row into the "⊘ hidden" group. We update the in-memory
     /// lists immediately so the row disappears without waiting for a poll.
+    /// True if a session has tmux activity newer than our last visit (and
+    /// isn't the one currently open) — drives the "fresh output" pill.
+    fn session_fresh(&self, hi: usize, si: usize) -> bool {
+        let e = &self.hosts[hi];
+        let s = &e.sessions[si];
+        let key = format!("{}/{}", e.host.name, s.name);
+        if self.active_key.as_deref() == Some(key.as_str()) {
+            return false;
+        }
+        match (s.activity, self.visited.get(&key)) {
+            (Some(act), Some(vis)) => act > *vis,
+            _ => false,
+        }
+    }
+
     pub fn is_favourite(&self, host: &str, name: &str) -> bool {
         self.favourites
             .iter()
@@ -1060,6 +1160,7 @@ impl App {
                 hint: None,
                 cwd: None,
                 has_log: false,
+                activity: None,
             });
         }
         self.status = format!("unhid {host_name}/{name}");
@@ -1886,6 +1987,7 @@ impl App {
                 // A session with a progress log gets a small amber dot after
                 // its name, so you can see which of many have context waiting.
                 let badge = matches!(row, Row::Session(hi, si, _) if self.hosts[*hi].sessions[*si].has_log);
+                let fresh = matches!(row, Row::Session(hi, si, _) if self.session_fresh(*hi, *si));
 
                 let text_rect = ui.painter().text(
                     rect.left_center() + Vec2::new(indent, 0.0),
@@ -1895,6 +1997,16 @@ impl App {
                     color,
                 );
                 let mut next_x = text_rect.right();
+                // Fresh-output pill: a bright green dot when there's been tmux
+                // activity since you last visited this session.
+                if fresh {
+                    ui.painter().circle_filled(
+                        egui::pos2(next_x + 8.0, rect.center().y),
+                        4.0,
+                        Color32::from_rgb(120, 230, 140),
+                    );
+                    next_x += 16.0;
+                }
                 if badge {
                     let dot = egui::pos2(next_x + 8.0, rect.center().y);
                     ui.painter().text(

@@ -43,6 +43,9 @@ pub struct SessionSnap {
     /// Whether a progress-log file exists at the git root of the focused
     /// pane's cwd — computed in the same host sweep so the sidebar can badge it.
     pub has_log: bool,
+    /// tmux `#{session_activity}` epoch — time of the session's last activity
+    /// (output). Compared against when we last visited to flag fresh output.
+    pub activity: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -61,7 +64,7 @@ pub struct SnapshotResult {
 /// without an extra connection per session.
 fn snapshot_command(log_filename: Option<&str>) -> String {
     let base = format!(
-        "tmux list-panes -a -F '#{{session_name}}{s}#{{session_created}}{s}#{{window_index}}{s}#{{window_name}}{s}#{{window_layout}}{s}#{{pane_index}}{s}#{{pane_pid}}{s}#{{pane_current_command}}{s}#{{pane_current_path}}{s}#{{pane_active}}' 2>&1; echo {m}; ps -eo ppid=,pid=,args= 2>/dev/null",
+        "tmux list-panes -a -F '#{{session_name}}{s}#{{session_created}}{s}#{{window_index}}{s}#{{window_name}}{s}#{{window_layout}}{s}#{{pane_index}}{s}#{{pane_pid}}{s}#{{pane_current_command}}{s}#{{pane_current_path}}{s}#{{pane_active}}{s}#{{session_activity}}' 2>&1; echo {m}; ps -eo ppid=,pid=,args= 2>/dev/null",
         s = SEP,
         m = PS_MARKER
     );
@@ -166,11 +169,12 @@ fn parse_snapshot(
     let mut sessions: Vec<SessionSnap> = Vec::new();
     for line in pane_part.lines() {
         let fields: Vec<&str> = line.split(SEP).collect();
-        if fields.len() != 10 {
+        if fields.len() != 11 {
             continue;
         }
         let name = fields[0].to_string();
         let created_at = fields[1].parse::<i64>().ok();
+        let activity = fields[10].trim().parse::<i64>().ok();
         let pane_pid = fields[6].parse::<i64>().unwrap_or(0);
         let pane = PaneSnap {
             window_index: fields[2].parse().unwrap_or(0),
@@ -191,6 +195,7 @@ fn parse_snapshot(
                     created_at,
                     panes: vec![pane],
                     has_log,
+                    activity,
                 })
             }
         }

@@ -225,6 +225,7 @@ impl Db {
             created_at: None,
             panes,
             has_log: false,
+            activity: None,
         })
     }
 
